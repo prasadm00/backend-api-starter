@@ -1,0 +1,64 @@
+{
+  "version": "0.2.0",
+  "compounds": [
+    {
+      "name": "Debug Server + Test Register",
+      "configurations": ["Debug Server", "Test Register API"],
+      "stopAll": true
+    }
+  ],
+  "configurations": [
+    {
+      "name": "Debug Server",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/server.ts"],
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"],
+      "env": { "NODE_ENV": "development" }
+    },
+    {
+      "name": "Test Register API",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "scripts/test-api.ts"],
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    }
+  ]
+}
+
+
+// {
+//   "version": "0.2.0",
+//   "compounds": [
+//     {
+//       "name": "Debug Server + Test Register",
+//       "configurations": ["Debug Server", "Test Register API"],
+//       "stopAll": true
+//     }
+//   ],
+//   "configurations": [
+//     {
+//       "name": "Debug Server",
+//       "type": "node",
+//       "request": "launch",
+//       "runtimeExecutable": "npx",
+//       "runtimeArgs": ["tsx", "src/server.ts"],
+//       "console": "integratedTerminal",
+//       "skipFiles": ["<node_internals>/**", "node_modules/node_modules/**"],
+//       "env": { "NODE_ENV": "development" }
+//     },
+//     {
+//       "name": "Test Register API",
+//       "type": "node",
+//       "request": "launch",
+//       "runtimeExecutable": "npx",
+//       "runtimeArgs": ["tsx", "scripts/test-api.ts"],
+//       "console": "integratedTerminal",
+//       "skipFiles": ["<node_internals>/**"]
+//     }
+//   ]
+// }
