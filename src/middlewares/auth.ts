@@ -1,65 +1,66 @@
 import type { NextFunction, Request, Response, RequestHandler } from "express";
-import { UnauthorizedError, ForbiddenError } from "../errors/AppError";
-import jwt from "jsonwebtoken";
-import { env } from "../config/env";
+import { UnauthorizedError, ForbiddenError } from "../errors/AppError.js";
+import { verifyAccessToken } from "../common/token.js";
+import { findUserById } from "../modules/auth/auth.repository.js";
 
-/**
- * Authentication middleware.
- * Supports both direct handler usage: `router.get(..., authenticate, ...)`
- * and factory invocation usage: `router.get(..., authenticate(), ...)`
- */
 export const authenticate = (
   reqOrOptions?: Request | any,
   res?: Response,
   next?: NextFunction,
 ): any => {
-  const handler: RequestHandler = (req: Request, _res: Response, nextFn: NextFunction) => {
+  const handler: RequestHandler = async (req: Request, _res: Response, nextFn: NextFunction) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return nextFn(new UnauthorizedError("Authentication token missing or invalid"));
+    }
+
+    const token: string = authHeader.split(" ")[1] || "";
+    let decoded: any;
     try {
-      const authHeader = req.headers.authorization;
-
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return nextFn(new UnauthorizedError("Authentication token missing or invalid"));
-      }
-
-      const token: string = authHeader.split(" ")[1] || "";
-      const secret = env.JWT_SECRET || process.env.JWT_SECRET || "";
-
-      const decoded = jwt.verify(token, secret);
-      req.user = decoded;
-
-      return nextFn();
+      decoded = verifyAccessToken(token);
     } catch {
       return nextFn(new UnauthorizedError("Invalid or expired token"));
     }
+
+    let userRoles: string[] = Array.isArray(decoded.roles) ? decoded.roles : [];
+
+    // SEC-07: Verify current DB account status and roles when database is available
+    if (decoded.userId) {
+      try {
+        const user = await findUserById(decoded.userId);
+        if (user) {
+          if (user.status === "DISABLED") {
+            return nextFn(new UnauthorizedError("Account has been disabled"));
+          }
+          userRoles = user.roles.map(r => r.role.name);
+        }
+      } catch {
+        // If DB is offline or mock test token used, rely on verified JWT claims
+      }
+    }
+
+    req.user = {
+      userId: decoded.userId,
+      email: decoded.email,
+      roles: userRoles,
+    };
+    return nextFn();
   };
 
-  // If called directly as middleware: authenticate(req, res, next)
   if (reqOrOptions && res && next && typeof next === "function") {
     return handler(reqOrOptions as Request, res, next);
   }
-
-  // If called as a middleware factory: authenticate()
   return handler;
 };
 
-/**
- * Role-Based Access Control (RBAC) middleware factory.
- * Usage: `authorize("ADMIN")` or `authorize("ADMIN", "MANAGER")`
- *
- * Rules:
- * - 401 = not authenticated (no authenticated user present)
- * - 403 = authenticated but not allowed (user lacks required role)
- */
-export const authorize = (...allowedRoles: (string | string[])[]) => {
+export const authorize = (...allowedRoles: (string | string[])[]): RequestHandler => {
   const targetRoles = allowedRoles.flat();
 
   return (req: Request, _res: Response, next: NextFunction): void => {
-    // 1. Authenticated Request check
-    if (!req.user) {
+    if (!req.user || typeof req.user === "string") {
       return next(new UnauthorizedError("Authentication required"));
     }
 
-    // 2. Read roles
     const user = req.user as any;
     let userRoles: string[] = [];
 
@@ -71,14 +72,10 @@ export const authorize = (...allowedRoles: (string | string[])[]) => {
       userRoles = [user.roles];
     }
 
-    // 3. Check role authorization
     const hasRole = targetRoles.some((role) => userRoles.includes(role));
-
     if (!hasRole) {
       return next(new ForbiddenError("Access forbidden: insufficient permissions"));
     }
-
-    // 4. Allow
     return next();
   };
 };

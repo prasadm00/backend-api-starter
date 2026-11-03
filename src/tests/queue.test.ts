@@ -1,7 +1,7 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert";
-import { LocalQueueService, type QueueService } from "../common/queue";
-import { registerUser } from "../modules/auth/auth.service";
+import { LocalQueueService, type QueueService } from "../common/queue.js";
+import { registerUser } from "../modules/auth/auth.service.js";
 
 describe("Task 22 & 23: Queue Abstraction and USER_REGISTERED Event", () => {
   let queue: LocalQueueService;

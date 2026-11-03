@@ -16,6 +16,9 @@ model User {
 
   roles         UserRole[]
   refreshTokens RefreshToken[]
+  products      Product[]
+  orders        Order[]
+  oauthAccounts OAuthAccount[]
 }
 
 model Role {
@@ -37,15 +40,152 @@ model UserRole {
 model RefreshToken {
   id        String    @id @default(uuid())
   userId    String
-  tokenHash String
+  tokenHash String    @unique
   expiresAt DateTime
   revokedAt DateTime?
   createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 enum UserStatus {
   ACTIVE
   DISABLED
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  name        String
+  description String
+  price       Decimal       @db.Decimal(10, 2)
+  currency    String        @default("USD")
+  status      ProductStatus @default(ACTIVE)
+  createdBy   String
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  creator    User        @relation(fields: [createdBy], references: [id])
+  inventory  Inventory?
+  orderItems OrderItem[]
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Inventory {
+  id                String   @id @default(uuid())
+  productId         String   @unique
+  availableQuantity Int      @default(0)
+  reservedQuantity  Int      @default(0)
+  updatedAt         DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  CANCELLED
+  EXPIRED
+}
+
+model Order {
+  id          String      @id @default(uuid())
+  userId      String
+  status      OrderStatus @default(PENDING_PAYMENT)
+  totalAmount Decimal     @db.Decimal(10, 2)
+  currency    String      @default("USD")
+  expiresAt   DateTime
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  productId String
+  quantity  Int
+  unitPrice Decimal @db.Decimal(10, 2)
+  lineTotal Decimal @db.Decimal(10, 2)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model Payment {
+  id                    String        @id @default(uuid())
+  orderId               String
+  provider              String        @default("STRIPE")
+  stripeSessionId       String?       @unique
+  stripePaymentIntentId String?       @unique
+  status                PaymentStatus @default(PENDING)
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String        @default("USD")
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model PaymentEvent {
+  id               String   @id @default(uuid())
+  provider         String   @default("STRIPE")
+  providerEventId  String   @unique
+  eventType        String
+  processedAt      DateTime @default(now())
+  processingStatus String   @default("SUCCESS")
+
+  @@index([provider, providerEventId])
+}
+
+model OAuthAccount {
+  id             String   @id @default(uuid())
+  userId         String
+  provider       String
+  providerUserId String
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+}
+
+// Transactional outbox: committed business events are retried until enqueued.
+model OutboxEvent {
+  id          String   @id @default(uuid())
+  sourceId    String   @unique
+  eventType   String
+  payload     Json
+  createdAt   DateTime @default(now())
+  publishedAt DateTime?
+  attempts    Int      @default(0)
+  lastError   String?
+
+  @@index([publishedAt, createdAt])
 }

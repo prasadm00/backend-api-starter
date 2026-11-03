@@ -1,74 +1,31 @@
 import type { Request, Response } from "express";
-import { type LoginInput, type RegisterInput, type RefreshTokenInput } from "./auth.types";
-import {
-  registerUser as registerUserService,
-  loginUser as loginUserService,
-  refreshAccessToken as refreshAccessTokenService,
-  logoutUser as logoutUserService,
-} from "./auth.service";
-import { logger } from "../../common/logger";
+import type { LoginInput, RegisterInput } from "./auth.types.js";
+import { registerUser as register, loginUser as login, refreshAccessToken as rotate, logoutUser as logout } from "./auth.service.js";
+import { UnauthorizedError } from "../../errors/AppError.js";
+import { REFRESH_COOKIE, setRefreshCookie, clearRefreshCookie, requireTrustedOrigin } from "./auth.cookies.js";
 
 export async function registerUser(req: Request, res: Response) {
-  const input = req.body as RegisterInput;
-
-  const user = await registerUserService(input);
-
-  res.status(201).json({
-    message: "User registered successfully",
-    user,
-  });
+  const user = await register(req.body as RegisterInput);
+  return res.status(201).json({ message: "User registered successfully", user });
 }
-
 export async function loginUser(req: Request, res: Response) {
-  const input = req.body as LoginInput;
-
-  const loginCredentials = await loginUserService(input);
-  logger.info(loginCredentials);
-
-  res.cookie("refreshToken", loginCredentials.refreshToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
-
-  return res.status(200).json({
-    message: "Login successful!",
-    data: loginCredentials,
-  });
+  requireTrustedOrigin(req);
+  const result = await login(req.body as LoginInput);
+  setRefreshCookie(res, result.refreshToken);
+  return res.json({ message: "Login successful", data: { accessToken: result.accessToken, user: result.user } });
 }
-
 export async function refreshAccessToken(req: Request, res: Response) {
-  const input = req.body as RefreshTokenInput;
-
-  const tokens = await refreshAccessTokenService(input);
-
-  // Set new refresh token in cookie
-  res.cookie("refreshToken", tokens.refreshToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-  });
-
-  return res.status(200).json({
-    message: "Token refreshed successfully",
-    data: tokens,
-  });
+  requireTrustedOrigin(req);
+  const rawToken = req.cookies?.[REFRESH_COOKIE];
+  if (typeof rawToken !== "string" || !rawToken) throw new UnauthorizedError("Refresh cookie required");
+  const result = await rotate({ refreshToken: rawToken });
+  setRefreshCookie(res, result.refreshToken);
+  return res.json({ message: "Token refreshed", data: { accessToken: result.accessToken } });
 }
-
 export async function logoutUser(req: Request, res: Response) {
-  // Get user from auth middleware (we'll add it later)
-  const userId = (req as Request & { userId?: string }).userId;
-
-  if (userId) {
-    await logoutUserService(userId);
-  }
-
-  // Clear refresh token cookie
-  res.clearCookie("refreshToken");
-
-  return res.status(200).json({
-    message: "Logged out successfully",
-  });
+  requireTrustedOrigin(req);
+  const rawToken = req.cookies?.[REFRESH_COOKIE];
+  if (typeof rawToken === "string" && rawToken) await logout(rawToken);
+  clearRefreshCookie(res);
+  return res.json({ message: "Logged out successfully" });
 }

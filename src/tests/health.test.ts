@@ -1,9 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import app from "../app";
-import { testRequest } from "./testHelper";
-import { prisma } from "../config/prisma";
-import { redisClient } from "../config/redis";
+import app from "../app.js";
+import { testRequest } from "./testHelper.js";
+import { prisma } from "../config/prisma.js";
+import { redisClient } from "../config/redis.js";
 
 describe("Task 24: Health Checks (Liveness and Readiness)", () => {
   describe("GET /health/live (Liveness Check)", () => {
@@ -63,7 +63,7 @@ describe("Task 24: Health Checks (Liveness and Readiness)", () => {
         assert.strictEqual(res.status, 503);
         assert.strictEqual(res.body.status, "not_ready");
         assert.strictEqual(res.body.checks.database.status, "down");
-        assert.ok(res.body.checks.database.error.includes("Database connection refused"));
+        assert.ok(res.body.checks.database.error === "Dependency unavailable");
         assert.strictEqual(res.body.checks.redis.status, "up");
       } finally {
         (prisma as any).$queryRawUnsafe = originalQueryRaw;
@@ -95,7 +95,7 @@ describe("Task 24: Health Checks (Liveness and Readiness)", () => {
         assert.strictEqual(res.body.status, "not_ready");
         assert.strictEqual(res.body.checks.database.status, "up");
         assert.strictEqual(res.body.checks.redis.status, "down");
-        assert.ok(res.body.checks.redis.error.includes("Redis connection timed out"));
+        assert.ok(res.body.checks.redis.error === "Dependency unavailable");
       } finally {
         (prisma as any).$queryRawUnsafe = originalQueryRaw;
         (redisClient as any).ping = originalPing;

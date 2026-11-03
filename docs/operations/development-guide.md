@@ -1,146 +1,50 @@
-# Development & Operations Guide
+# Local development guide
 
-This guide covers local environment setup, container management, database migrations, seeding, and automated testing workflows.
+## Setup
 
----
+1. Install Node.js 22, npm and Docker Engine/Compose.
+2. Copy `.env.example` to `.env`, replace `JWT_SECRET` with a fresh long random value, and provide DB/Redis URLs.
+3. `docker compose up -d db cache` (host ports 5433 and 6379).
+4. `npm ci && npx prisma generate && npx prisma migrate deploy`.
+5. `npm run typecheck && npm run build && npm test`.
+6. Start API (`npm run dev`) and worker (`npm run worker`) in separate terminals.
+7. Check `/health/live`, `/health/ready`, and `/docs/json`.
 
-## 1. Local Environment Prerequisites
+`npm test` runs integration tests and needs its **own isolated database** migrated to the latest schema, not production. CI supplies ephemeral Postgres/Redis containers.
 
-* **Node.js**: v20 or newer (`node -v`)
-* **Docker & Docker Compose**: v2+ (`docker compose version`)
-* **npm**: v10+
+## Admin provisioning
 
----
-
-## 2. Environment Variables Reference
-
-Create a `.env` file in the project root:
-
-```env
-# Server
-PORT=3000
-NODE_ENV=development
-
-# PostgreSQL (matching docker-compose.yml port mapping 5433:5432)
-DATABASE_URL=postgresql://postgres:mysecretpassword@127.0.0.1:5433/my_database
-
-# Redis (matching docker-compose.yml port 6379)
-REDIS_URL=redis://localhost:6379
-
-# JWT Authentication
-JWT_SECRET=super-secret-jwt-key-with-at-least-32-characters-minimum
-JWT_EXPIRES_IN=15m
-JWT_REFRESH_EXPIRES_IN=7d
-```
-
-Variables are validated at startup via **Zod** in [`src/config/env.ts`](../../src/config/env.ts). If any required variable is missing or invalid, the process will fail fast with a descriptive error tree.
-
----
-
-## 3. Docker Container Management
-
-PostgreSQL and Redis run via `docker-compose.yml`:
+The seed script requires explicit nondefault admin credentials. Example:
 
 ```bash
-# Start all infrastructure containers in the background
-docker compose up -d
-
-# Check status of running containers
-docker compose ps
-
-# View live logs for PostgreSQL
-docker compose logs -f db
-
-# View live logs for Redis
-docker compose logs -f cache
-
-# Access PostgreSQL psql shell inside container
-docker compose exec db psql -U postgres -d my_database
-
-# Access Redis CLI inside container
-docker compose exec cache redis-cli
-
-# Stop containers (preserves data in volumes)
-docker compose down
-
-# Stop containers and wipe all volume data
-docker compose down -v
+ADMIN_EMAIL='your-admin@example.com' ADMIN_PASSWORD='YOUR_UNIQUE_LONG_PASSWORD' npm run seed:admin
 ```
 
----
+Never use real administrator credentials in committed scripts, shell history or archives. The script does not print the password.
 
-## 4. Prisma 7 Database Workflows
+## Optional providers
 
-Prisma 7 uses the `@prisma/adapter-pg` driver adapter. Database URLs live in `prisma.config.ts`.
+**Stripe:** create a Stripe test-mode API key and configure `STRIPE_SECRET_KEY`. Use Stripe CLI/test dashboard to obtain a webhook secret for `/api/v1/webhooks/stripe`; configure `STRIPE_WEBHOOK_SECRET`. Checkout URLs must use a deployed/accessible `PUBLIC_BASE_URL` for redirects. A Checkout success redirect alone is not payment confirmation.
+
+**Google:** create an OAuth web client. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and exact `GOOGLE_CALLBACK_URL` (`http://localhost:3000/api/v1/auth/google/callback` for local testing). Start at `GET /auth/google` in a browser session that retains the flow cookie, then navigate to its returned URL. Login callback verifies state, PKCE, nonce and Google's signed ID token.
+
+**Email:** `EMAIL_TRANSPORT=log` does not send email. A real HTTP adapter can be configured using `EMAIL_TRANSPORT=webhook`, `EMAIL_API_URL`, `EMAIL_API_KEY`. Verify the provider accepts `{to,subject,text}` and an `Idempotency-Key` header; otherwise implement your provider's actual integration before using it.
+
+## Docker Compose: API + worker
 
 ```bash
-# Run migrations and apply pending changes
-npx prisma migrate dev --name <migration_name>
-
-# Regenerate Prisma Client TypeScript types
-npx prisma generate
-
-# Validate schema syntax without touching database
-npx prisma validate
-
-# Open Prisma Studio web visualizer
-npx prisma studio
+docker compose up -d --build db cache
+docker compose run --rm api npm run db:deploy
+docker compose up -d --build api worker
+docker compose logs -f api worker
 ```
 
----
+Compose database/Redis addresses are service names `db`/`cache`, not localhost. Production must use managed/private services, secure credentials and IAM roles. These commands were not executed inside this artifact environment because Docker and npm registry access were not available.
 
-## 5. Seeding the Admin User
+## Tests and build
 
-To create or refresh the administrator user account for testing:
+`npm run typecheck`, `npm run build`, `npm test`. Build is NodeNext ESM; `.js` specifiers appear in TypeScript imports by design so emitted JS resolves under Node. `npm start` runs the compiled API and `npm run worker:prod` the compiled worker.
 
-```bash
-npm run seed:admin
-```
+## Working branch and safety
 
-This runs [`scripts/seed-admin.ts`](../../scripts/seed-admin.ts), ensuring the `ADMIN` role is created in the database, hashing the password using Argon2, and assigning the role.
-
-**Default Admin Credentials:**
-* **Email:** `admin@example.com`
-* **Password:** `AdminPassword123!`
-* **Role:** `ADMIN`
-
-To seed a custom admin user:
-```bash
-ADMIN_EMAIL=custom@example.com ADMIN_PASSWORD=CustomPass123! npm run seed:admin
-```
-
----
-
-## 6. Running the Application
-
-### Development Server (with hot reloading)
-```bash
-npm run dev
-```
-The server listens at `http://localhost:3000`.
-
-### Production Build & Execution
-```bash
-# Compile TypeScript to JavaScript in /dist
-npm run build
-
-# Start the compiled application
-npm start
-```
-
----
-
-## 7. Automated Test Suite
-
-Integration tests run with Node's native test runner via `tsx`:
-
-```bash
-npm test
-```
-
-### Test Suites Inventory
-* [`src/tests/rbac-admin.test.ts`](../../src/tests/rbac-admin.test.ts): RBAC middleware evaluation (401, 403, 200) and `/api/v1/admin/health` endpoint tests.
-* [`src/tests/queue.test.ts`](../../src/tests/queue.test.ts): `LocalQueueService` contract and post-commit `USER_REGISTERED` event verification.
-* [`src/tests/redis.test.ts`](../../src/tests/redis.test.ts): Redis client connection management and `SET/GET health:redis` contract.
-* [`src/tests/health.test.ts`](../../src/tests/health.test.ts): Liveness probe (`200`) and Readiness probe (`200` healthy, `503` degraded).
-* [`src/tests/swagger.test.ts`](../../src/tests/swagger.test.ts): Swagger UI and OpenAPI schema validation.
+Extract the updated ZIP to a fresh directory, compare changes with your own working tree, **do not blindly overwrite work committed since the ZIP snapshot**, review Prisma migrations, and run checks before merging. Neither `.env` nor `.git` is included in the updated ZIP.

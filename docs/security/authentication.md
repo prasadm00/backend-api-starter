@@ -1,95 +1,51 @@
-# Authentication & Token Management
+# Authentication, refresh tokens and Google OAuth
 
-This document details the authentication flow, password hashing, JWT generation, and refresh token rotation mechanisms.
+## Password login
 
----
-
-## 1. Authentication Lifecycle
+- `POST /api/v1/auth/register`: validate and normalize email, Argon2 password hash, assign `USER`, create transactional outbox record.
+- `POST /api/v1/auth/login`: verify password and active account; issue a short-lived `HS256` JWT with controlled issuer/audience; store a high-entropy opaque refresh token as SHA-256 digest.
+- Successful login returns only the access JWT + user profile in JSON; the **raw refresh token is HttpOnly cookie-only** (`refreshToken`).
+- `POST /api/v1/auth/refresh`: reads cookie; in one DB transaction conditionally revokes the old digest and inserts the new digest. One concurrent reuse can win; the other must fail. Response returns access token and a rotated cookie, no plaintext refresh token JSON.
+- `POST /api/v1/auth/logout`: revokes the **presented session**, clears cookie. An existing access JWT remains usable until expiry; all-session revocation is not implemented.
+- `GET /api/v1/auth/me`: access JWT required, current user loaded from DB. Disabled users denied and actual role assignments consulted instead of trusting stale JWT role claims.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    actor Client
-    participant AuthRouter as Auth Controller
-    participant AuthService as Auth Service
-    participant Repo as Auth Repository
-    participant DB as PostgreSQL DB
-
-    Client->>AuthRouter: POST /api/v1/auth/login (email, password)
-    AuthRouter->>AuthService: loginUser(input)
-    AuthService->>Repo: findUserByEmail(email)
-    Repo->>DB: Query User with Roles
-    DB-->>Repo: User record with passwordHash & roles
-    Repo-->>AuthService: User entity
-
-    AuthService->>AuthService: argon2.verify(passwordHash, password)
-    Note over AuthService: Password valid
-
-    AuthService->>AuthService: generateAccessToken({ userId, email, roles })
-    AuthService->>AuthService: crypto.randomBytes(40).toString('hex')
-    AuthService->>Repo: createRefreshToken(tokenHash, userId, expiresAt)
-    Repo->>DB: INSERT INTO "RefreshToken"
-    DB-->>Repo: Created token
-    Repo-->>AuthService: Token record
-
-    AuthService-->>AuthRouter: { accessToken, refreshToken, user }
-    AuthRouter->>Client: 200 OK + Set-Cookie: refreshToken (httpOnly)
+  participant B as Browser
+  participant API
+  participant DB
+  B->>API: POST /login email + password
+  API->>DB: Verify account + insert hashed refresh token
+  API-->>B: access JWT in JSON, raw refresh token HttpOnly cookie
+  B->>API: POST /refresh with cookie
+  API->>DB: Atomic conditional revoke old digest + create new digest
+  API-->>B: New access JWT + rotated cookie
+  B->>API: POST /logout with cookie
+  API->>DB: Revoke presented digest
+  API-->>B: Clear cookie
 ```
 
----
+Security policies:
 
-## 2. Password Security with Argon2
+- Bearer JWT must have correct signature, expiry, issuer, audience, HS256 algorithm, and valid user ID/email/role structure.
+- Cookie is `HttpOnly` with `SameSite=Lax`; `Secure` in production. Cookie-backed mutations reject an unexpected browser `Origin`. Set precise `CORS_ORIGINS`; this is not a general substitute for full CSRF analysis in arbitrary frontends.
+- Local authentication rate limiter is process-memory only (20 attempts / 15 min per IP), not suitable alone for multi-node production; use shared gateway/WAF enforcement.
+- `.env` contains secrets and is excluded from provided ZIP and Git. Avoid logging passwords, raw tokens and provider credentials.
 
-Passwords are encrypted using **Argon2id** via the `argon2` library:
+## Google OAuth / OIDC
 
-* **Hashing during Registration (`src/modules/auth/auth.repository.ts`)**:
-  ```ts
-  const passwordHash = await argon2.hash(data.password);
-  ```
-* **Verification during Login (`src/modules/auth/auth.service.ts`)**:
-  ```ts
-  const isPasswordValid = await argon2.verify(userExists.passwordHash || "", password);
-  if (!isPasswordValid) {
-    throw new UnauthorizedError("Invalid email or password");
-  }
-  ```
+1. `GET /api/v1/auth/google` generates a randomized OAuth state, PKCE verifier/challenge and nonce. Signed flow data is saved in a short-lived HttpOnly cookie (`google_oauth_flow`). The JSON response contains the authorization URL.
+2. Browser navigates to the URL and authenticates with Google.
+3. Google redirects to `GET /api/v1/auth/google/callback?code=...&state=...`. The backend validates signed cookie + state; exchanges the code with `code_verifier` and client secret.
+4. Google `id_token` is verified **cryptographically** against Google's published JWKS public keys and checked for allowed issuer, audience, expiry, matching nonce, verified email and stable `sub`.
+5. Existing `(provider='GOOGLE',providerUserId=sub)` signs in to that user. Unknown identity can create a Google-only account unless the email already belongs to a local user; email collision requires explicit linking.
+6. Linking: authenticated caller requests `GET /api/v1/auth/google/link` with bearer JWT, navigates to the returned URL, completes the same verified callback. The signed context binds the previously authenticated user; no raw identity ID is accepted from request body.
 
----
+Never accept `mockSub`, `mockEmail`, decoded-but-unverified JWT payload or direct `googleSub` to establish a user identity. The previous ZIP did so; that path was removed.
 
-## 3. JWT Access Token Structure
+**Configuration:** `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_CALLBACK_URL` required for use. Missing credentials return 503, not a fake successful login. The browser must preserve the OAuth cookie across the authorization redirect; HTTPS is required in production.
 
-Access tokens are signed using HMAC-SHA256 with the secret `env.JWT_SECRET`:
+### Remaining security tasks
 
-* **Expiration**: Configurable via `env.JWT_EXPIRES_IN` (default: `15m`).
-* **Payload Claims**:
-  ```json
-  {
-    "userId": "uuid-v4",
-    "email": "user@example.com",
-    "roles": ["USER", "ADMIN"],
-    "iat": 1727980000,
-    "exp": 1727980900
-  }
-  ```
-
----
-
-## 4. Refresh Token Rotation (RTR)
-
-To protect against token theft, refresh tokens follow a strict rotation model:
-
-```mermaid
-flowchart TD
-    ReqToken["Client submits refreshToken"] --> Lookup["Query DB for tokenHash & unrevoked status"]
-    Lookup --> Found{"Valid & Unrevoked?"}
-    Found -- "No" --> Reject["401 Unauthorized\n(Token invalid or reused)"]
-    Found -- "Yes" --> RevokeOld["Revoke Old Token\nSET revokedAt = NOW()"]
-    RevokeOld --> IssueNew["Generate New Access Token & New Refresh Token"]
-    IssueNew --> SaveNew["Persist New Refresh Token in DB"]
-    SaveNew --> Respond["Return New Access Token & Set New Cookie"]
-```
-
-1. **Exchange**: The client sends the refresh token to `POST /api/v1/auth/refresh`.
-2. **Revocation**: The old refresh token is marked revoked immediately (`revokedAt = new Date()`).
-3. **Re-issuance**: A new access token and a brand-new cryptographically random refresh token are created and stored.
-4. **Logout**: When `POST /api/v1/auth/logout` is called, all active refresh tokens for the user are revoked.
+- Add Redis/gateway-wide rate limiting, account recovery, security key rotation, password reset, session device listings, user-level logout-all, and automated OIDC integration tests in a network-enabled environment.
+- Consider requiring recent password reauthentication before linking a high-value identity.

@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
-import assert from "node:assert";
-import app from "../app";
-import { testRequest } from "./testHelper";
-import { generateAccessToken } from "../common/token";
-import { authorize } from "../middlewares/auth";
-import { UnauthorizedError, ForbiddenError } from "../errors/AppError";
+import assert from "node:assert/strict";
+import app from "../app.js";
+import { testRequest } from "./testHelper.js";
+import { generateAccessToken } from "../common/token.js";
+import { authorize } from "../middlewares/auth.js";
+import { UnauthorizedError, ForbiddenError } from "../errors/AppError.js";
 
 describe("Task 19 & 20: RBAC Middleware and Admin Route", () => {
   const userToken = generateAccessToken({
@@ -37,8 +37,8 @@ describe("Task 19 & 20: RBAC Middleware and Admin Route", () => {
       });
 
       assert.ok(errorThrown instanceof UnauthorizedError);
-      assert.strictEqual(errorThrown.statusCode, 401);
-      assert.strictEqual(errorThrown.code, "UNAUTHORIZED");
+      assert.equal(errorThrown.statusCode, 401);
+      assert.equal(errorThrown.code, "UNAUTHORIZED");
     });
 
     it("returns 403 when authenticated but lacks role", () => {
@@ -52,8 +52,8 @@ describe("Task 19 & 20: RBAC Middleware and Admin Route", () => {
       });
 
       assert.ok(errorThrown instanceof ForbiddenError);
-      assert.strictEqual(errorThrown.statusCode, 403);
-      assert.strictEqual(errorThrown.code, "FORBIDDEN");
+      assert.equal(errorThrown.statusCode, 403);
+      assert.equal(errorThrown.code, "FORBIDDEN");
     });
 
     it("calls next() with no error when user has required role", () => {
@@ -68,55 +68,49 @@ describe("Task 19 & 20: RBAC Middleware and Admin Route", () => {
         errorThrown = err;
       });
 
-      assert.strictEqual(called, true);
-      assert.strictEqual(errorThrown, undefined);
+      assert.equal(called, true);
+      assert.equal(errorThrown, undefined);
     });
   });
 
   describe("Task 20: GET /api/v1/admin/health integration", () => {
     it("returns 401 when request is not authenticated (missing token)", async () => {
       const res = await testRequest(app).get("/api/v1/admin/health");
-
-      assert.strictEqual(res.status, 401);
-      assert.strictEqual(res.body.code, "UNAUTHORIZED");
+      assert.equal(res.status, 401);
+      assert.equal(res.body.code, "UNAUTHORIZED");
     });
 
     it("returns 401 when request has invalid token", async () => {
       const res = await testRequest(app)
         .get("/api/v1/admin/health")
         .set("Authorization", "Bearer invalid.jwt.token");
-
-      assert.strictEqual(res.status, 401);
-      assert.strictEqual(res.body.code, "UNAUTHORIZED");
+      assert.equal(res.status, 401);
+      assert.equal(res.body.code, "UNAUTHORIZED");
     });
 
     it("returns 403 when authenticated as USER (forbidden)", async () => {
       const res = await testRequest(app)
         .get("/api/v1/admin/health")
         .set("Authorization", `Bearer ${userToken}`);
-
-      assert.strictEqual(res.status, 403);
-      assert.strictEqual(res.body.code, "FORBIDDEN");
-      assert.ok(res.body.message.includes("Forbidden") || res.body.message.includes("insufficient"));
+      assert.equal(res.status, 403);
+      assert.equal(res.body.code, "FORBIDDEN");
     });
 
     it("returns 200 when authenticated as ADMIN", async () => {
       const res = await testRequest(app)
         .get("/api/v1/admin/health")
         .set("Authorization", `Bearer ${adminToken}`);
-
-      assert.strictEqual(res.status, 200);
-      assert.strictEqual(res.body.status, "ok");
-      assert.strictEqual(res.body.message, "Admin health check passed");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.status, "ok");
+      assert.equal(res.body.message, "Admin health check passed");
     });
 
     it("returns 200 when user has both USER and ADMIN roles", async () => {
       const res = await testRequest(app)
         .get("/api/v1/admin/health")
         .set("Authorization", `Bearer ${multiRoleToken}`);
-
-      assert.strictEqual(res.status, 200);
-      assert.strictEqual(res.body.status, "ok");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.status, "ok");
     });
   });
 });

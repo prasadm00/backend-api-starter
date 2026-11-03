@@ -1,9 +1,13 @@
 import { createClient, type RedisClientType } from "redis";
-import { env } from "./env";
-import { logger } from "../common/logger";
+import { env } from "./env.js";
+import { logger } from "../common/logger.js";
 
 export const redisClient: RedisClientType = createClient({
   url: env.REDIS_URL,
+  socket: {
+    connectTimeout: 1500,
+    reconnectStrategy: retries => retries > 2 ? new Error("Redis unavailable") : Math.min(100 * retries, 500),
+  },
 });
 
 redisClient.on("error", (err) => {

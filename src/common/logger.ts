@@ -1,17 +1,38 @@
 import pino from "pino";
 
 export const logger = pino({
-  // Set the default logging level based on the environment
   level: process.env.LOG_LEVEL || "info",
-
-  // Formatters let you customize the output keys
   formatters: {
     level(label) {
-      return { level: label }; // Converts numeric levels (like 30) into strings (like "info")
+      return { level: label };
     },
   },
-
-  // Pretty-print logs ONLY during local development (speeds up production)
+  redact: {
+    paths: [
+      "req.headers.authorization",
+      "headers.authorization",
+      "req.headers.cookie",
+      "headers.cookie",
+      "cookie",
+      "clientSecret",
+      "secret",
+      "*.clientSecret",
+      "*.secret",
+      "authorization",
+      "password",
+      "passwordHash",
+      "token",
+      "accessToken",
+      "refreshToken",
+      "tokenHash",
+      "*.password",
+      "*.token",
+      "*.accessToken",
+      "*.refreshToken",
+      "*.tokenHash",
+    ],
+    censor: "[REDACTED]",
+  },
   ...(process.env.NODE_ENV !== "production" && {
     transport: { target: "pino-pretty", options: { colorize: true } },
   }),

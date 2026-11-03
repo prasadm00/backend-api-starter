@@ -1,184 +1,86 @@
-# API Endpoints & Specification
+# REST API catalog
 
-This document provides a complete reference for all HTTP endpoints exposed by the API, including payload contracts, authentication schemes, and Swagger documentation.
+**Base URL:** `http://localhost:3000/api/v1`. The repository also mounts `/v1` aliases; treat `/api/v1` as canonical. Interactive OpenAPI: `/docs/`. Machine-readable spec: `/docs/json`. Request IDs returned as `x-request-id`.
 
----
+| Method | Path | Required permission | Notes |
+|---|---|---|---|
+| GET | `/health/live`, `/health/ready` | Public | Process & dependency health (not under API prefix) |
+| POST | `/auth/register` | Public | Email/password registration |
+| POST | `/auth/login` | Public | Access JWT JSON + HttpOnly refresh cookie |
+| POST | `/auth/refresh` | Refresh cookie | Atomically rotate refresh, return access JWT |
+| POST | `/auth/logout` | Refresh cookie optional | Revoke presented refresh session |
+| GET | `/auth/me` or `/users/me` | Bearer JWT | Active current profile |
+| GET | `/auth/google` | Public | Authorization URL + signed flow cookie |
+| GET | `/auth/google/callback` | OAuth flow cookie and code/state | Verify Google identity and sign in/link |
+| GET | `/auth/google/link` | Bearer JWT | Start explicit linking flow |
+| GET | `/admin/health` | ADMIN bearer JWT | RBAC check |
+| GET | `/products` | Public | `page`, `limit`, `status`, `search`, `sortBy`, `sortOrder` |
+| GET | `/products/:id` | Public | Product detail + inventory |
+| POST | `/products` | ADMIN bearer JWT | Create product + inventory |
+| PATCH | `/products/:id` | ADMIN bearer JWT | Update fields and available stock |
+| PATCH | `/products/:id/status` | ADMIN bearer JWT | Activate/deactivate |
+| POST | `/orders` | Bearer JWT | Reserve stock, create pending order |
+| GET | `/orders` | Bearer JWT | Own order list, `page`, `limit`, `status` |
+| GET | `/orders/:id` | Order owner or ADMIN | Details and history |
+| POST | `/orders/:id/cancel` | Owner or ADMIN | Only before any Stripe Checkout is initiated |
+| POST | `/orders/:id/checkout` | Order owner | Create Stripe test Checkout session |
+| GET | `/orders/:id/payment` | Owner or ADMIN | Database payment state; redirects never prove payment |
+| POST | `/webhooks/stripe` | Valid Stripe signature | Raw JSON body, idempotent event processing |
 
-## 1. Swagger & OpenAPI Documentation
+### Requests (replace placeholders)
 
-The API includes an embedded **OpenAPI 3.0** specification served interactively via Swagger UI:
+Register:
 
-| Resource | URL | Description |
-| :--- | :--- | :--- |
-| **Swagger UI** | `http://localhost:3000/docs` | Interactive API explorer & testing sandbox |
-| **Alternative UI Path** | `http://localhost:3000/api-docs` | Mirror route for Swagger UI |
-| **OpenAPI Spec (JSON)** | `http://localhost:3000/docs/json` | Raw OpenAPI 3.0 JSON specification |
-
----
-
-## 2. Global Error Response Standard
-
-All errors return a predictable JSON payload:
-
-```json
-{
-  "code": "ERROR_CODE",
-  "message": "Human readable error description",
-  "errors": {
-    "field": "Optional validation or diagnostic details"
-  }
-}
+```bash
+curl -X POST http://localhost:3000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"customer@example.com","password":"BetterPassword123!"}'
 ```
 
-### Standard Status Codes
-* `400 Bad Request` (`BAD_REQUEST`): Malformed JSON or input validation failure.
-* `401 Unauthorized` (`UNAUTHORIZED`): Missing or invalid authentication token.
-* `403 Forbidden` (`FORBIDDEN`): Authenticated user lacks required role/permission.
-* `404 Not Found` (`NOT_FOUND`): Target resource does not exist.
-* `409 Conflict` (`CONFLICT`): Resource already registered (e.g. duplicate email).
-* `422 Unprocessable Entity` (`VALIDATION_ERROR`): Schema validation errors.
-* `500 Internal Error` (`INTERNAL_ERROR`): Unhandled system exceptions.
-* `503 Service Unavailable` (`NOT_READY`): Readiness check failure.
+Login and save HttpOnly cookie for refresh:
 
----
+```bash
+curl -c cookies.txt -X POST http://localhost:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"customer@example.com","password":"BetterPassword123!"}'
+# Copy the accessToken from the returned JSON into the next commands.
+curl -b cookies.txt -c cookies.txt -X POST http://localhost:3000/api/v1/auth/refresh
+```
 
-## 3. Endpoints Catalog
+Create a product (ADMIN token):
 
-### Health Module
+```bash
+curl -X POST http://localhost:3000/api/v1/products \
+  -H "Authorization: Bearer YOUR_ADMIN_ACCESS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"USB Keyboard","description":"Example product","price":25.99,"currency":"USD","stock":3}'
+```
 
-#### `GET /health/live`
-* **Auth**: None
-* **Description**: Liveness probe confirming Node.js event loop is operational.
-* **Response `200 OK`**:
-  ```json
-  {
-    "status": "ok",
-    "uptimeSeconds": 128,
-    "timestamp": "2026-10-03T20:30:00.000Z"
-  }
-  ```
+Reserve inventory for an order:
 
-#### `GET /health/ready`
-* **Auth**: None
-* **Description**: Readiness probe querying PostgreSQL (`SELECT 1`) and Redis (`PING`).
-* **Response `200 OK`** (Ready):
-  ```json
-  {
-    "status": "ready",
-    "checks": {
-      "database": { "status": "up", "latencyMs": 2 },
-      "redis": { "status": "up", "latencyMs": 1 }
-    },
-    "timestamp": "2026-10-03T20:30:00.000Z"
-  }
-  ```
-* **Response `503 Service Unavailable`** (Degraded):
-  ```json
-  {
-    "status": "not_ready",
-    "checks": {
-      "database": { "status": "down", "error": "Database connection refused" },
-      "redis": { "status": "up" }
-    },
-    "timestamp": "2026-10-03T20:30:00.000Z"
-  }
-  ```
+```bash
+curl -X POST http://localhost:3000/api/v1/orders \
+  -H "Authorization: Bearer YOUR_CUSTOMER_ACCESS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"items":[{"productId":"PRODUCT_UUID","quantity":1}]}'
+```
 
----
+Create Stripe test Checkout for resulting order:
 
-### Authentication Module
+```bash
+curl -X POST http://localhost:3000/api/v1/orders/ORDER_UUID/checkout \
+  -H "Authorization: Bearer YOUR_CUSTOMER_ACCESS_TOKEN"
+```
 
-#### `POST /api/v1/auth/register`
-* **Auth**: None
-* **Description**: Creates a new user with default role `USER`. Dispatches `USER_REGISTERED` event after DB commit.
-* **Request Body**:
-  ```json
-  {
-    "email": "jane@example.com",
-    "password": "SecurePassword123!"
-  }
-  ```
-* **Response `201 Created`**:
-  ```json
-  {
-    "message": "User registered successfully",
-    "user": {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "email": "jane@example.com",
-      "status": "ACTIVE",
-      "roles": ["USER"]
-    }
-  }
-  ```
+**Stripe webhook:** configure the URL and real webhook secret using Stripe CLI/test dashboard. Do **not** replay unsigned JSON; the endpoint intentionally rejects it. Google callback likewise requires a real Google authorization code and signed state cookie.
 
-#### `POST /api/v1/auth/login`
-* **Auth**: None
-* **Description**: Verifies credentials. Returns JWT access token (with user roles) and sets httpOnly refresh token cookie.
-* **Request Body**:
-  ```json
-  {
-    "email": "admin@example.com",
-    "password": "AdminPassword123!"
-  }
-  ```
-* **Response `200 OK`**:
-  ```json
-  {
-    "message": "Login successful!",
-    "data": {
-      "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-      "refreshToken": "4a73d32847cbb6509f7a8340...",
-      "user": {
-        "id": "550e8400-e29b-41d4-a716-446655440000",
-        "email": "admin@example.com"
-      }
-    }
-  }
-  ```
+## Response and errors
 
-#### `POST /api/v1/auth/refresh`
-* **Auth**: None (Refresh Token required in payload)
-* **Description**: Exchanges valid refresh token for rotated tokens.
-* **Request Body**:
-  ```json
-  {
-    "refreshToken": "4a73d32847cbb6509f7a8340..."
-  }
-  ```
-* **Response `200 OK`**:
-  ```json
-  {
-    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "refreshToken": "e93ab238f92110c71a823b19..."
-  }
-  ```
+Success shapes are module-specific (`{ status:'success', data }` or `{ message, data }`); errors consistently include `{ "code": "...", "message": "..." }` with optional safe validation details. Typical codes: 400 input problem; 401 no/invalid auth; 403 insufficient access; 404 missing resource; 409 conflict/stock/payment-state race; 422 schema validation; 429 auth rate limit; 503 provider not configured or dependency unavailable.
 
-#### `POST /api/v1/auth/logout`
-* **Auth**: None / Authenticated
-* **Description**: Revokes active user refresh tokens.
-* **Response `200 OK`**:
-  ```json
-  {
-    "message": "Logged out successfully"
-  }
-  ```
+## Data and security caveats
 
----
-
-### Admin Module
-
-#### `GET /api/v1/admin/health`
-* **Auth**: Bearer JWT (`authenticate()`)
-* **Role Required**: `ADMIN` (`authorize("ADMIN")`)
-* **Description**: Protected administrative health inspection.
-* **Headers**: `Authorization: Bearer <ADMIN_ACCESS_TOKEN>`
-* **Response `200 OK`**:
-  ```json
-  {
-    "status": "ok",
-    "message": "Admin health check passed",
-    "timestamp": "2026-10-03T20:30:00.000Z"
-  }
-  ```
-* **Response `401 Unauthorized`**: If token is missing, expired, or invalid.
-* **Response `403 Forbidden`**: If token has role `USER` instead of `ADMIN`.
+- Product price is server-derived, stored as a Prisma Decimal snapshot in order items. Do not send your own payment total in checkout requests.
+- `POST /orders` rejects duplicated product IDs, mixed currencies and unavailable inventory; its stock updates are conditional.
+- A checkout session is only valid within the active order reservation. Once Checkout is initiated, direct cancellation is intentionally blocked pending external reconciliation.
+- Google login and linking require verified OIDC claims; no mock/test identity bypass exists.
+- Refresh tokens are cookie-only; do not send a `refreshToken` JSON body.
+- **No actual email is sent in default `EMAIL_TRANSPORT=log` mode.**

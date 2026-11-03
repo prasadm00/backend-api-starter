@@ -24,8 +24,8 @@ export class TestRequestBuilder {
     this.path = path;
   }
 
-  set(headerName: string, value: string): this {
-    this.headers[headerName.toLowerCase()] = value;
+  set(headerName: string, value: string | string[]): this {
+    this.headers[headerName.toLowerCase()] = Array.isArray(value) ? value.join("; ") : value;
     return this;
   }
 
@@ -42,17 +42,19 @@ export class TestRequestBuilder {
       req.url = this.path;
       req.headers = { host: "localhost", ...this.headers };
 
-      let bodyData = "";
+      let bodyBuffer: Buffer | null = null;
       if (this.payload !== null && this.payload !== undefined) {
-        if (typeof this.payload === "object") {
-          bodyData = JSON.stringify(this.payload);
+        if (Buffer.isBuffer(this.payload)) {
+          bodyBuffer = this.payload;
+        } else if (typeof this.payload === "object") {
+          bodyBuffer = Buffer.from(JSON.stringify(this.payload));
           if (!req.headers["content-type"]) {
             req.headers["content-type"] = "application/json";
           }
         } else {
-          bodyData = String(this.payload);
+          bodyBuffer = Buffer.from(String(this.payload));
         }
-        req.headers["content-length"] = Buffer.byteLength(bodyData).toString();
+        req.headers["content-length"] = bodyBuffer.length.toString();
       }
 
       const res = new http.ServerResponse(req);
@@ -87,9 +89,9 @@ export class TestRequestBuilder {
         return res;
       };
 
-      if (bodyData) {
+      if (bodyBuffer) {
         process.nextTick(() => {
-          req.push(bodyData);
+          req.push(bodyBuffer);
           req.push(null);
         });
       } else {
@@ -119,6 +121,7 @@ export function testRequest(app: Application) {
     get: (path: string) => new TestRequestBuilder(app, "GET", path),
     post: (path: string) => new TestRequestBuilder(app, "POST", path),
     put: (path: string) => new TestRequestBuilder(app, "PUT", path),
+    patch: (path: string) => new TestRequestBuilder(app, "PATCH", path),
     delete: (path: string) => new TestRequestBuilder(app, "DELETE", path),
   };
 }

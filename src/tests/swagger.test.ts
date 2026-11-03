@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import app from "../app";
-import { testRequest } from "./testHelper";
+import app from "../app.js";
+import { testRequest } from "./testHelper.js";
 
 describe("Swagger API Documentation", () => {
   it("GET /docs/json returns valid OpenAPI 3.0 specification", async () => {

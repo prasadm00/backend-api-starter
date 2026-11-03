@@ -1,1 +1,1 @@
-export { authorize } from "./auth";
+export { authorize } from "./auth.js";

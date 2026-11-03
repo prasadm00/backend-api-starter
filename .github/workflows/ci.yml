@@ -1,0 +1,84 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Build, Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: mysecretpassword
+          POSTGRES_DB: my_database
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:mysecretpassword@127.0.0.1:5433/my_database
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_SECRET: super-secret-jwt-key-with-at-least-32-characters-minimum
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      STRIPE_SECRET_KEY: sk_test_placeholder
+      STRIPE_WEBHOOK_SECRET: whsec_placeholder
+      GOOGLE_CLIENT_ID: google_client_id_placeholder
+      GOOGLE_CLIENT_SECRET: google_client_secret_placeholder
+      GOOGLE_CALLBACK_URL: http://localhost:3000/api/v1/auth/google/callback
+      CORS_ORIGINS: http://localhost:3000
+      PUBLIC_BASE_URL: http://localhost:3000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Prisma Schema
+        run: npx prisma validate
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Run Prisma Migrations
+        run: npx prisma migrate deploy
+
+      - name: Run TypeScript Type Check
+        run: npm run typecheck
+
+      - name: Build Application & Worker Bundle
+        run: npm run build
+
+      - name: Run Automated Test Suite
+        run: npm test

@@ -1,117 +1,53 @@
-# Data Model & Schema
+# Database schema & invariants
 
-This document outlines the database schema, entity relationships, and migration procedures managed by **Prisma 7** with PostgreSQL.
-
----
-
-## 1. Entity-Relationship Diagram (ERD)
+Source of truth: `prisma/schema.prisma` and migrations. PostgreSQL is the transactional system of record.
 
 ```mermaid
 erDiagram
-    User ||--o{ UserRole : "assigned via"
-    Role ||--o{ UserRole : "grouped by"
-    User ||--o{ RefreshToken : "owns"
-
-    User {
-        String id PK "UUID"
-        String email UK "Unique email address"
-        String passwordHash "Argon2 hashed password"
-        DateTime createdAt "Creation timestamp"
-        DateTime updatedAt "Last update timestamp"
-        UserStatus status "ACTIVE | DISABLED"
-    }
-
-    Role {
-        String id PK "UUID"
-        String name UK "Unique role name (e.g. USER, ADMIN)"
-    }
-
-    UserRole {
-        String userId PK, FK "References User.id (CASCADE)"
-        String roleId PK, FK "References Role.id (CASCADE)"
-    }
-
-    RefreshToken {
-        String id PK "UUID"
-        String userId FK "References User.id (CASCADE)"
-        String tokenHash "Cryptographically secure random token"
-        DateTime expiresAt "Expiration timestamp"
-        DateTime revokedAt "Null if valid, set upon rotation/logout"
-        DateTime createdAt "Timestamp created"
-    }
+    User ||--o{ UserRole : has
+    Role ||--o{ UserRole : granted
+    User ||--o{ RefreshToken : owns
+    User ||--o{ OAuthAccount : links
+    User ||--o{ Product : creates
+    User ||--o{ Order : places
+    Product ||--o| Inventory : tracked_by
+    Product ||--o{ OrderItem : purchased_in
+    Order ||--o{ OrderItem : contains
+    Order ||--o{ Payment : attempts
+    PaymentEvent { string providerEventId UK }
+    OutboxEvent { string sourceId UK }
 ```
 
----
+## Central tables
 
-## 2. Models & Data Structure Details
+| Model | Important constraints / fields |
+|---|---|
+| `User` | Unique email, status `ACTIVE/DISABLED`; nullable password hash for Google-only users |
+| `Role` / `UserRole` | Unique role name; composite primary key `(userId,roleId)` |
+| `RefreshToken` | **Only SHA-256 digest** stored as `tokenHash UNIQUE`; expiry + revocation timestamp |
+| `OAuthAccount` | Unique `(provider,providerUserId)`; never use email alone for implicit account linking |
+| `Product` | Decimal price snapshot source, currency and `ACTIVE/INACTIVE` status |
+| `Inventory` | Unique `productId`, nonnegative available and reserved counts via DB CHECK constraints |
+| `Order` | `PENDING_PAYMENT`, `PAID`, `CANCELLED`, `EXPIRED`, expiry and user owner |
+| `OrderItem` | Quantity > 0; `unitPrice` and `lineTotal` snapshots from server-side product prices |
+| `Payment` | Unique nullable Stripe session and payment intent IDs; bound to order and amount/currency |
+| `PaymentEvent` | Unique `providerEventId`, used for idempotent webhook processing |
+| `OutboxEvent` | Unique `sourceId`, event/payload, published timestamp, retry attempt count |
 
-### User (`prisma.user`)
-Stores user accounts.
-* `id` (`String`): UUID primary key.
-* `email` (`String`): Unique user identifier.
-* `passwordHash` (`String?`): Argon2id password hash.
-* `status` (`UserStatus`): Enumeration with values `ACTIVE` or `DISABLED`.
-* `roles` (`UserRole[]`): Many-to-many relationship with `Role` through `UserRole`.
-* `refreshTokens` (`RefreshToken[]`): User's issued refresh tokens.
+## Transaction boundaries
 
-### Role (`prisma.role`)
-Stores assignable system roles.
-* `id` (`String`): UUID primary key.
-* `name` (`String`): Unique identifier (e.g. `USER`, `ADMIN`).
+1. **Register user:** create user + default role + outbox in one transaction; password hash computed before transaction.
+2. **Order creation:** check product, conditionally reserve each inventory item using `updateMany ... availableQuantity >= qty`; create order + items + outbox in one transaction. Reject duplicate product IDs.
+3. **Order cancellation:** conditional transition from `PENDING_PAYMENT`, reject any pending Stripe payment, release inventory conditionally within same transaction.
+4. **Payment webhook:** signed event dedup, session binding, amount/currency check, conditional order transition, stock finalization and notification outbox in one transaction.
+5. **Refresh rotation:** conditional old-token consumption + new hashed-token insert in one transaction.
 
-### UserRole (`prisma.userRole`)
-Composite junction table implementing the many-to-many relationship between `User` and `Role`.
-* `userId` + `roleId`: Composite primary key (`@@id([userId, roleId])`).
-* `onDelete: Cascade`: When a user or role is deleted, corresponding associations are removed.
+## Index choices
 
-### RefreshToken (`prisma.refreshToken`)
-Enforces secure token rotation and multi-device session management.
-* `tokenHash` (`String`): 80-character hex string generated via `crypto.randomBytes(40)`.
-* `expiresAt` (`DateTime`): Token validity limit (e.g. 7 days).
-* `revokedAt` (`DateTime?`): Used for revocation upon logout or token rotation. Tokens with a non-null `revokedAt` or expired `expiresAt` are rejected.
+`User.email`, `RefreshToken.tokenHash`, `OAuthAccount(provider,providerUserId)`, `Inventory.productId`, `Order(userId,createdAt DESC)`, `Payment.stripeSessionId`, `PaymentEvent.providerEventId`, and `OutboxEvent(publishedAt,createdAt)` support common lookups and worker polling. Profile actual query performance using EXPLAIN before adding speculative indexes.
 
----
+### Known schema follow-ups
 
-## 3. Prisma 7 Driver Adapter Configuration
-
-Prisma 7 uses driver adapters to connect to PostgreSQL over TCP sockets instead of an external Rust binary engine:
-
-* **Configuration File (`prisma.config.ts`)**:
-  ```ts
-  import "dotenv/config";
-  import { defineConfig, env } from "prisma/config";
-
-  export default defineConfig({
-    schema: "prisma/schema.prisma",
-    datasource: {
-      url: env("DATABASE_URL"),
-    },
-  });
-  ```
-
-* **Client Instantiation (`src/config/prisma.ts`)**:
-  ```ts
-  import { PrismaClient } from "@prisma/client";
-  import { PrismaPg } from "@prisma/adapter-pg";
-
-  const adapter = new PrismaPg(process.env.DATABASE_URL!);
-  export const prisma = new PrismaClient({ adapter });
-  ```
-
----
-
-## 4. Migration & Schema Workflow
-
-```bash
-# Apply schema changes and create a migration file
-npx prisma migrate dev --name <migration_name>
-
-# Regenerate Prisma Client types
-npx prisma generate
-
-# Validate schema without running migrations
-npx prisma validate
-
-# Format schema syntax
-npx prisma format
-```
+- No automatic lifecycle sweeper yet for abandoned/expired Stripe Checkout; reconcile before releasing stock.
+- Currency mismatch across order items is rejected; actual provider capability/currency-specific decimal rules should be validated before expanding beyond USD-like minor units.
+- Historical order price remains in `OrderItem` even if current catalog price changes.

@@ -7,7 +7,7 @@ export const swaggerDocument = {
     title: "Backend API Documentation",
     version: "1.0.0",
     description:
-      "Production-ready REST API featuring JWT Authentication, Role-Based Access Control (RBAC), Queue event publishing, Redis integration, and Kubernetes-compliant Health Checks.",
+      "E-commerce backend REST API: secure auth, Product/Order CRUD, Stripe Checkout and webhook, Google OIDC, Redis caching and BullMQ transactional outbox.",
   },
   servers: [
     {
@@ -289,7 +289,8 @@ export const swaggerDocument = {
             },
           },
           "503": {
-            description: "Service unavailable: one or more dependencies are down",
+            description:
+              "Service unavailable: one or more dependencies are down",
             content: {
               "application/json": {
                 schema: {
@@ -506,6 +507,303 @@ export const swaggerDocument = {
     },
   },
 };
+
+// API catalog extension - mounted endpoints are the source of truth.
+Object.assign(swaggerDocument.components.securitySchemes, {
+  RefreshCookie: {
+    type: "apiKey",
+    in: "cookie",
+    name: "refreshToken",
+    description: "HttpOnly refresh cookie set by login or Google callback",
+  },
+});
+Object.assign(swaggerDocument.paths, {
+  "/api/v1/auth/login": {
+    post: {
+      tags: ["Auth"],
+      summary: "Password login (sets HttpOnly refresh cookie)",
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/LoginRequest" },
+          },
+        },
+      },
+      responses: {
+        "200": {
+          description:
+            "Access JWT in JSON; refresh token only in HttpOnly cookie",
+        },
+        "401": { description: "Invalid credentials or disabled account" },
+        "429": { description: "Rate limit" },
+      },
+    },
+  },
+  "/api/v1/auth/refresh": {
+    post: {
+      tags: ["Auth"],
+      summary: "Rotate refresh cookie; return access JWT",
+      security: [{ RefreshCookie: [] }],
+      responses: {
+        "200": { description: "New access token; rotated refresh cookie" },
+        "401": { description: "Missing, reused or expired refresh cookie" },
+        "403": { description: "Untrusted browser origin" },
+      },
+    },
+  },
+  "/api/v1/auth/logout": {
+    post: {
+      tags: ["Auth"],
+      summary: "Revoke presented refresh session and clear cookie",
+      security: [{ RefreshCookie: [] }],
+      responses: { "200": { description: "Session logged out" } },
+    },
+  },
+  "/api/v1/auth/me": {
+    get: {
+      tags: ["Auth"],
+      summary: "Current profile",
+      security: [{ BearerAuth: [] }],
+      responses: {
+        "200": { description: "Current active user" },
+        "401": { description: "No/invalid JWT or disabled user" },
+      },
+    },
+  },
+  "/api/v1/auth/google": {
+    get: {
+      tags: ["Google OAuth"],
+      summary: "Get Google authorization URL and establish state/PKCE cookie",
+      responses: {
+        "200": { description: "Returns URL" },
+        "503": { description: "Google OAuth not configured" },
+      },
+    },
+  },
+  "/api/v1/auth/google/link": {
+    get: {
+      tags: ["Google OAuth"],
+      summary: "Begin explicit Google account linking",
+      security: [{ BearerAuth: [] }],
+      responses: { "200": { description: "Returns URL" } },
+    },
+  },
+  "/api/v1/auth/google/callback": {
+    get: {
+      tags: ["Google OAuth"],
+      summary:
+        "Verify state, exchange code, verify Google ID token and sign in/link",
+      parameters: [
+        {
+          name: "state",
+          in: "query",
+          required: true,
+          schema: { type: "string" },
+        },
+        {
+          name: "code",
+          in: "query",
+          required: true,
+          schema: { type: "string" },
+        },
+      ],
+      responses: {
+        "200": { description: "Login or linking completed" },
+        "401": { description: "Unverified state or identity" },
+      },
+    },
+  },
+  "/api/v1/products": {
+    get: {
+      tags: ["Products"],
+      summary: "List products with pagination/filtering",
+      parameters: [
+        { name: "page", in: "query", schema: { type: "integer", default: 1 } },
+        {
+          name: "limit",
+          in: "query",
+          schema: { type: "integer", default: 20 },
+        },
+        {
+          name: "status",
+          in: "query",
+          schema: { type: "string", enum: ["ACTIVE", "INACTIVE"] },
+        },
+        { name: "search", in: "query", schema: { type: "string" } },
+      ],
+      responses: { "200": { description: "Products and pagination" } },
+    },
+    post: {
+      tags: ["Products"],
+      summary: "Create product and inventory (ADMIN)",
+      security: [{ BearerAuth: [] }],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: {
+              type: "object",
+              required: ["name", "price"],
+              properties: {
+                name: { type: "string" },
+                description: { type: "string" },
+                price: { type: "number" },
+                currency: {
+                  type: "string",
+                  enum: ["USD", "EUR", "GBP", "INR"],
+                },
+                stock: { type: "integer" },
+              },
+            },
+          },
+        },
+      },
+      responses: {
+        "201": { description: "Created" },
+        "403": { description: "ADMIN required" },
+      },
+    },
+  },
+  "/api/v1/products/{id}": {
+    get: {
+      tags: ["Products"],
+      summary: "Get product by ID",
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: {
+        "200": { description: "Product" },
+        "404": { description: "Not found" },
+      },
+    },
+    patch: {
+      tags: ["Products"],
+      summary: "Update product (ADMIN)",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: { "200": { description: "Updated" } },
+    },
+  },
+  "/api/v1/products/{id}/status": {
+    patch: {
+      tags: ["Products"],
+      summary: "Activate/deactivate product (ADMIN)",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: { "200": { description: "Updated" } },
+    },
+  },
+  "/api/v1/orders": {
+    get: {
+      tags: ["Orders"],
+      summary: "List caller's orders",
+      security: [{ BearerAuth: [] }],
+      responses: { "200": { description: "Orders with pagination" } },
+    },
+    post: {
+      tags: ["Orders"],
+      summary: "Reserve inventory and create pending order",
+      security: [{ BearerAuth: [] }],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: {
+              type: "object",
+              required: ["items"],
+              properties: {
+                items: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["productId", "quantity"],
+                    properties: {
+                      productId: { type: "string", format: "uuid" },
+                      quantity: { type: "integer", minimum: 1 },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      responses: {
+        "201": { description: "Order created; stock reserved" },
+        "409": { description: "Out of stock" },
+      },
+    },
+  },
+  "/api/v1/orders/{id}": {
+    get: {
+      tags: ["Orders"],
+      summary: "Get own order (or ADMIN)",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: {
+        "200": { description: "Order" },
+        "403": { description: "Not owner" },
+      },
+    },
+  },
+  "/api/v1/orders/{id}/cancel": {
+    post: {
+      tags: ["Orders"],
+      summary: "Cancel order before checkout begins and release stock",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: {
+        "200": { description: "Cancelled" },
+        "409": { description: "Payment initiated or order finalized" },
+      },
+    },
+  },
+  "/api/v1/orders/{id}/checkout": {
+    post: {
+      tags: ["Payments"],
+      summary: "Create Stripe Checkout session for a pending order",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: {
+        "200": { description: "Checkout URL" },
+        "503": { description: "Stripe not configured" },
+      },
+    },
+  },
+  "/api/v1/orders/{id}/payment": {
+    get: {
+      tags: ["Payments"],
+      summary: "Get trusted server-side payment state",
+      security: [{ BearerAuth: [] }],
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+      ],
+      responses: { "200": { description: "Order/payment status" } },
+    },
+  },
+  "/api/v1/webhooks/stripe": {
+    post: {
+      tags: ["Payments"],
+      summary: "Signature-verified raw-body Stripe webhook",
+      responses: {
+        "200": { description: "Event processed or safely ignored" },
+        "401": { description: "Invalid signature" },
+        "409": { description: "Reconciliation required" },
+      },
+    },
+  },
+});
 
 export const swaggerRouter = Router();
 

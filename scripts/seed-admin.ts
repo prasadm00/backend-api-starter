@@ -1,9 +1,12 @@
 import argon2 from "argon2";
-import { prisma } from "../src/config/prisma";
+import { prisma } from "../src/config/prisma.js";
 
 async function seedAdmin() {
-  const email = process.env.ADMIN_EMAIL || "admin@example.com";
-  const password = process.env.ADMIN_PASSWORD || "AdminPassword123!";
+  const email = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD;
+  if (!email || !password || password.length < 12) {
+    throw new Error("Explicit ADMIN_EMAIL and ADMIN_PASSWORD (12+ chars) required");
+  }
 
   console.log(`\nSetting up admin user: ${email}...`);
 
@@ -88,7 +91,7 @@ async function seedAdmin() {
   console.log(" Admin Credentials for Testing: ");
   console.log("=================================");
   console.log(` Email:    ${email}`);
-  console.log(` Password: ${password}`);
+  console.log(" Password: [never printed]");
   console.log(` Role:     ADMIN`);
   console.log("=================================\n");
 }

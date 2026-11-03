@@ -1,7 +1,7 @@
 import { type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { ValidationError } from "../../errors/AppError";
-import { loginSchema, registerSchema, refreshTokenSchema } from "./auth.types";
+import { ValidationError } from "../../errors/AppError.js";
+import { loginSchema, registerSchema } from "./auth.types.js";
 
 export function validateUserRegister(
   req: Request,
@@ -40,23 +40,5 @@ export function validateUserLogin(
   }
   req.body = result.data;
 
-  next();
-}
-export function validateRefreshToken(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
-  const result = refreshTokenSchema.safeParse(req.body);
-
-  if (!result.success) {
-    const errors = result.error.issues.map((err: z.ZodIssue) => ({
-      field: err.path.join("."),
-      message: err.message,
-    }));
-    next(new ValidationError("Invalid refresh token", errors));
-    return;
-  }
-  req.body = result.data;
   next();
 }

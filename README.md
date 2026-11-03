@@ -1,332 +1,316 @@
-# Backend API & Architecture Reference
+# Production-Ready E-Commerce Backend API
 
-A production-ready RESTful backend built with **Node.js**, **Express 5**, **TypeScript**, **Prisma 7** (PostgreSQL driver adapter), **Redis**, and **Pino**. Features JWT authentication with role-based access control (RBAC), queue abstraction with event publishing, Kubernetes-compliant health probes, and interactive Swagger documentation.
+A high-performance, resilient, and secure **E-Commerce Backend API** built with **Node.js 22**, **Express 5**, **TypeScript**, **Prisma 7**, **PostgreSQL 16**, **Redis 7**, **BullMQ**, and **Stripe**.
 
----
-
-## 📚 Documentation Hub
-
-Complete technical documentation is organized in the [`docs/`](./docs/README.md) directory:
-
-* **[Architecture Overview](./docs/architecture/overview.md)** — Layered architecture, request pipeline, design patterns.
-* **[Data Model & Schema](./docs/architecture/data-model.md)** — Entity-Relationship Diagram, Prisma models, migrations.
-* **[Role-Based Access Control (RBAC)](./docs/security/rbac.md)** — `authenticate()` and `authorize("ADMIN")`, 401 vs 403.
-* **[Authentication & Token Management](./docs/security/authentication.md)** — JWT, refresh token rotation, Argon2 hashing.
-* **[Queue Abstraction & Events](./docs/infrastructure/queue.md)** — `QueueService` interface, post-commit `USER_REGISTERED` event.
-* **[Redis Integration](./docs/infrastructure/redis.md)** — Connection management, infrastructure verification.
-* **[Health Checks & Probes](./docs/infrastructure/health-checks.md)** — Kubernetes Liveness & Readiness monitoring.
-* **[API Endpoints & Swagger](./docs/api/endpoints.md)** — Complete endpoint catalog and OpenAPI contracts.
-* **[Development & Operations Guide](./docs/operations/development-guide.md)** — Docker setup, seeding admin user, testing.
+This backend implements a complete, fault-tolerant e-commerce lifecycle:
+1. **Authentication & Identity**: Argon2 password hashing, stateless short-lived JWT access tokens, cryptographically secure opaque refresh tokens stored as SHA-256 digests in HttpOnly cookies, and strict Google OAuth 2.0 / OIDC with PKCE.
+2. **Product & Inventory Management**: Full product CRUD with Zod validation, role-based access control (`ADMIN` vs `USER`), and high-performance Redis cache-aside with graceful fallback to PostgreSQL.
+3. **Atomic Stock Reservation**: Concurrency-safe order placement preventing overselling under heavy load via database-level transaction row locks and conditional decrements.
+4. **Stripe Test Checkout & Webhook Idempotency**: Card payment sessions with signature verification, raw request stream parsing, and idempotent database transaction state transitions.
+5. **Durable Background Workers & Transactional Outbox**: Atomic database event outbox polling, BullMQ queueing with Redis, exponential backoff retries, and asynchronous order/registration confirmation processing.
+6. **Containerization & CI/CD**: Multi-stage production `Dockerfile`, `docker-compose.yml`, and GitHub Actions automated testing workflow.
 
 ---
 
-## Architecture Overview
+## 🏗️ Architecture & Component Flow
 
 ```mermaid
 flowchart TD
-    Client["Client / Frontend"] --> Ingress["Express Application (App.ts)"]
-
-    subgraph Middleware["Global Middleware Pipeline"]
-        Ingress --> ReqId["Request ID Middleware (x-request-id)"]
-        ReqId --> ReqLog["Structured Request Logger (Pino)"]
-        ReqLog --> BodyParse["JSON / URL-Encoded Parser"]
-    end
-
-    subgraph Routing["Route Handlers & Security"]
-        BodyParse --> DocsRoute["Swagger UI (/docs, /api-docs)"]
-        BodyParse --> HealthRoute["Health Module (/health)"]
-        BodyParse --> AuthRoute["Auth Module (/api/v1/auth)"]
-        BodyParse --> AdminRoute["Admin Module (/api/v1/admin)"]
-
-        AdminRoute --> AuthMiddleware["authenticate()"]
-        AuthMiddleware --> RBACMiddleware["authorize('ADMIN')"]
-        RBACMiddleware --> AdminController["Admin Controller"]
-    end
-
-    subgraph Infrastructure["Services & Persistence Layer"]
-        HealthRoute --> PG_Health["PostgreSQL Connection Probe"]
-        HealthRoute --> Redis_Health["Redis Ping Probe"]
-
-        AuthRoute --> AuthService["Auth Service"]
-        AuthService --> PrismaRepo["Prisma Client (@prisma/adapter-pg)"]
-        PrismaRepo --> PostgresDB[("PostgreSQL 16 DB")]
-
-        AuthService --> QueueAdapter["Queue Service (LocalQueueService)"]
-        QueueAdapter --> Logger["Logger / Future SQS Broker"]
-
-        Redis_Health --> RedisInstance[("Redis Cache")]
-    end
+    Client["Client / Postman / Frontend"] --> Express["Express 5 REST API"]
+    Express --> Security["Security: Helmet, CORS, Rate Limit, RequestID, Pino"]
+    Security --> AuthGuard["Auth Guard: JWT & DB Account Status & RBAC"]
+    AuthGuard --> Controllers["Controllers (Zod Validation)"]
+    Controllers --> Services["Domain Services"]
+    Services --> Cache[("Redis Cache (Cache-Aside)")]
+    Services --> Repos["Prisma 7 Repositories"]
+    Repos --> Postgres[("PostgreSQL 16 (Source of Truth)")]
+    Repos --> OutboxTable[("OutboxEvent (Atomic DB Commit)")]
+    OutboxTable --> Poller["Outbox Poller Service"]
+    Poller --> BullMQ["BullMQ Queue (Redis)"]
+    BullMQ --> Worker["Asynchronous Email Worker"]
+    Worker --> EmailGateway["Email Transport / Webhook"]
+    Services --> StripeAPI["Stripe Checkout API"]
+    StripeAPI --> StripeWebhook["Stripe Signed Webhook"]
+    StripeWebhook --> Express
+    GoogleAuth["Google Identity / OIDC JWKS"] --> Services
 ```
 
 ---
 
-## Core Features & Technical Design
+## ⚡ Concurrency & Payment Sequence Flows
 
-### 1. Role-Based Access Control (RBAC)
-
-The security layer enforces a strict distinction between authentication and authorization:
-* **401 Unauthorized**: The request lacks a valid token or the token is expired/invalid.
-* **403 Forbidden**: The request is authenticated, but the user lacks the required permission/role.
-
-```mermaid
-flowchart TD
-    Req["Incoming HTTP Request"] --> Auth["authenticate() Middleware"]
-    Auth --> HasToken{"Valid Bearer Token?"}
-    HasToken -- "No" --> Ret401["Return 401 Unauthorized"]
-    HasToken -- "Yes" --> DecodeJWT["Decode JWT & Attach req.user"]
-
-    DecodeJWT --> RBAC["authorize('ADMIN') Middleware"]
-    RBAC --> HasUser{"req.user Exists?"}
-    HasUser -- "No" --> Ret401RBAC["Return 401 Unauthorized"]
-    HasUser -- "Yes" --> CheckRole{"Contains 'ADMIN' Role?"}
-    CheckRole -- "No" --> Ret403["Return 403 Forbidden"]
-    CheckRole -- "Yes" --> NextHandler["next() -> Allow Handler Execution (200 OK)"]
-```
-
----
-
-### 2. Event-Driven Queue Abstraction (`USER_REGISTERED`)
-
-The queue system uses dependency abstraction (`QueueService` interface) allowing seamless transition from a local logger adapter to cloud queue systems (such as AWS SQS).
-
-**Rule:** Domain events (e.g. `USER_REGISTERED`) are published **only after** the database transaction has committed.
+### 1. Atomic Order Stock Reservation (Zero Overselling)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client
-    participant AuthController as Auth Controller
-    participant AuthService as Auth Service
-    participant Repo as Auth Repository
-    participant DB as PostgreSQL Transaction
-    participant Queue as QueueService (LocalQueueService)
+    participant Customer as Customer Client
+    participant API as Orders API
+    participant DB as PostgreSQL (Transaction)
+    participant Outbox as Outbox Table
+    participant Worker as Background Worker
 
-    Client->>AuthController: POST /api/v1/auth/register (email, password)
-    AuthController->>AuthService: registerUser(input)
-    AuthService->>Repo: findUserByEmail(email)
-    Repo-->>AuthService: null (user does not exist)
-
-    AuthService->>Repo: createUser(data)
-    Repo->>DB: BEGIN Transaction
-    Repo->>DB: INSERT INTO "User" & INSERT INTO "UserRole"
-    DB-->>Repo: COMMIT Transaction
-    Repo-->>AuthService: user created & committed
-
-    Note over AuthService,Queue: Safe to publish: DB commit verified!
-    AuthService->>Queue: publish("USER_REGISTERED", { userId, email })
-    Queue-->>AuthService: logged / enqueued
-
-    AuthService-->>AuthController: user details
-    AuthController-->>Client: 201 Created
+    Customer->>API: POST /api/v1/orders { items: [{ productId, quantity }] }
+    Note over API: Snapshot current product prices from DB
+    API->>DB: BEGIN TRANSACTION
+    loop For each item in order
+        API->>DB: UPDATE "Inventory" SET available = available - qty, reserved = reserved + qty WHERE productId = id AND available >= qty
+        DB-->>API: Rows Affected (Must be 1)
+    end
+    alt Insufficient stock on any item
+        API->>DB: ROLLBACK TRANSACTION
+        API-->>Customer: 409 Conflict ("Insufficient available stock")
+    else All items reserved
+        API->>DB: INSERT INTO "Order" (status: 'PENDING_PAYMENT', expiresAt: +15m)
+        API->>DB: INSERT INTO "OrderItem" (snapshot unitPrice, lineTotal)
+        API->>DB: INSERT INTO "OutboxEvent" (eventType: 'ORDER_CREATED')
+        API->>DB: COMMIT TRANSACTION
+        API-->>Customer: 201 Created (Order Details & Reservation)
+        Worker->>Outbox: Poll unpublished events
+        Worker->>Worker: Enqueue ORDER_CREATED to BullMQ
+    end
 ```
 
----
-
-### 3. Kubernetes-Compliant Health Probes
-
-Two dedicated health probe endpoints ensure proper container lifecycle management:
+### 2. Stripe Checkout & Idempotent Webhook Finalization
 
 ```mermaid
-flowchart TD
-    subgraph LivenessProbe["Liveness Probe: GET /health/live"]
-        LivenessReq["Kubelet Probe"] --> LiveCheck{"Process Running?"}
-        LiveCheck -- "Yes" --> Live200["200 OK (Keep Pod Running)"]
-        LiveCheck -- "No / Hangs" --> LiveFail["Kubelet Restarts Pod"]
-    end
+sequenceDiagram
+    autonumber
+    participant Customer
+    participant API as Backend API
+    participant Stripe as Stripe Gateway
+    participant DB as PostgreSQL
+    participant Worker as BullMQ Worker
 
-    subgraph ReadinessProbe["Readiness Probe: GET /health/ready"]
-        ReadyReq["Load Balancer / Kubelet"] --> DBCheck{"PostgreSQL Ping (SELECT 1)"}
-        DBCheck -- "Success" --> RedisCheck{"Redis Ping (PING -> PONG)"}
-        DBCheck -- "Failure" --> ReadyFail["503 Service Unavailable"]
-        RedisCheck -- "Failure" --> ReadyFail
-        RedisCheck -- "Success" --> Ready200["200 OK (Send Traffic to Pod)"]
-        ReadyFail --> LBStop["Stop Routing Traffic to Instance"]
+    Customer->>API: POST /api/v1/orders/:id/checkout
+    API->>DB: Verify caller ownership, status = PENDING_PAYMENT, expiresAt > now
+    API->>Stripe: Create Checkout Session (idempotencyKey: checkout:{orderId})
+    Stripe-->>API: Session ID & Payment URL
+    API->>DB: Store pending Payment record (stripeSessionId)
+    API-->>Customer: { checkoutUrl }
+    Customer->>Stripe: Complete Card Payment in Stripe Hosted UI
+    Stripe->>API: POST /api/v1/webhooks/stripe (raw JSON + Stripe-Signature)
+    API->>API: Verify Stripe webhook signature with signing secret
+    API->>DB: BEGIN TRANSACTION
+    API->>DB: INSERT INTO "PaymentEvent" (providerEventId)
+    alt Duplicate Event (Unique Constraint Violation)
+        API->>DB: ROLLBACK TRANSACTION
+        API-->>Stripe: 200 OK (Duplicate event safely acknowledged)
+    else First Delivery
+        API->>DB: Verify order status == 'PENDING_PAYMENT'
+        API->>DB: UPDATE "Order" SET status = 'PAID'
+        API->>DB: UPDATE "Inventory" SET reserved = reserved - qty (Sold)
+        API->>DB: UPDATE "Payment" SET status = 'COMPLETED'
+        API->>DB: INSERT INTO "OutboxEvent" (eventType: 'PAYMENT_CONFIRMED')
+        API->>DB: COMMIT TRANSACTION
+        API-->>Stripe: 200 OK (Event processed successfully)
+        Worker->>DB: Read Outbox & Enqueue email confirmation
     end
 ```
 
 ---
 
-### 4. Database Schema (Prisma)
+## 🗄️ Database Entity-Relationship Model
 
 ```mermaid
 erDiagram
-    User ||--o{ UserRole : "has"
-    Role ||--o{ UserRole : "assigned_to"
-    User ||--o{ RefreshToken : "owns"
-
-    User {
+    User ||--o{ UserRole : has
+    Role ||--o{ UserRole : assigned
+    User ||--o{ RefreshToken : owns
+    User ||--o{ OAuthAccount : links
+    User ||--o{ Product : creates
+    User ||--o{ Order : places
+    Product ||--o| Inventory : manages
+    Product ||--o{ OrderItem : included_in
+    Order ||--o{ OrderItem : contains
+    Order ||--o{ Payment : generates
+    PaymentEvent {
         string id PK
-        string email UK
-        string passwordHash
-        enum status "ACTIVE | DISABLED"
+        string provider
+        string providerEventId UK
+        string eventType
+        datetime processedAt
+    }
+    OutboxEvent {
+        string id PK
+        string sourceId UK
+        string eventType
+        json payload
         datetime createdAt
-        datetime updatedAt
-    }
-
-    Role {
-        string id PK
-        string name UK "USER | ADMIN"
-    }
-
-    UserRole {
-        string userId PK, FK
-        string roleId PK, FK
-    }
-
-    RefreshToken {
-        string id PK
-        string userId FK
-        string tokenHash
-        datetime expiresAt
-        datetime revokedAt
-        datetime createdAt
+        datetime publishedAt
     }
 ```
 
 ---
 
-## API Endpoints Reference
+## 🔒 Security & Resilience Invariants
 
-| Method | Endpoint | Auth Required | Role | Description |
-| :--- | :--- | :---: | :---: | :--- |
-| `GET` | `/` | No | - | Root greeting check |
-| `GET` | `/docs` | No | - | Interactive Swagger UI |
-| `GET` | `/docs/json` | No | - | Raw OpenAPI 3.0 specification |
-| `GET` | `/health/live` | No | - | **Liveness Probe**: returns 200 if process is alive |
-| `GET` | `/health/ready` | No | - | **Readiness Probe**: returns 200 if DB & Redis are reachable, 503 if down |
-| `POST` | `/api/v1/auth/register` | No | - | Register user, assign `USER` role, emit `USER_REGISTERED` |
-| `POST` | `/api/v1/auth/login` | No | - | Authenticate with email/password, issues JWT |
-| `POST` | `/api/v1/auth/refresh` | No | - | Rotates refresh token & issues new access token |
-| `POST` | `/api/v1/auth/logout` | No | - | Revokes refresh tokens |
-| `GET` | `/api/v1/admin/health` | **Yes** | `ADMIN` | Protected admin health check (403 for non-admin) |
+| Invariant | Implementation Mechanism | Threat Mitigated |
+|---|---|---|
+| **Token Theft & Replay** | Opaque cryptographically random tokens; only SHA-256 hashes (`tokenHash`) stored in DB; transported via `HttpOnly`, `SameSite: strict` cookies. Atomic token rotation with compare-and-swap. | Cross-Site Scripting (XSS), token replay attacks, database leak exposure. |
+| **Overselling Race Conditions** | Atomic conditional inventory reservation (`availableQuantity >= quantity`) inside a database transaction with price snapshotting. | Concurrency race conditions, negative inventory, checkout price tampering. |
+| **Webhook Forgery & Duplicates** | Raw request body parsing before `express.json()`; cryptographic HMAC signature verification; unique `providerEventId` deduplication in DB transaction. | Man-in-the-middle forging, payment replay attacks, double fulfillment. |
+| **Crash Consistency Gap** | Transactional Outbox Pattern: events committed to PostgreSQL in the exact same transaction as the domain change, then asynchronously drained into BullMQ. | Lost events caused by Redis / network outages occurring right after database commit. |
+| **Privilege Escalation** | RBAC middleware re-verifies account active status and current roles against PostgreSQL on sensitive routes. | Stale JWT claims after role demotion or account deactivation (`DISABLED`). |
 
 ---
 
-## Getting Started
+## 🚀 Quick Start Guide
 
-### 1. Prerequisites
-* **Node.js** v20+
-* **Docker & Docker Compose**
+### Prerequisites
+- **Node.js**: v20+ (tested on Node v26 and v22)
+- **npm**: v10+
+- **Docker & Docker Compose**: (for containerized DB and Redis)
 
-### 2. Environment Configuration
-Create a `.env` file in the root directory:
+### 1. Installation & Environment Configuration
+```bash
+# Clone the repository and enter directory
+cd 01-backend-api
 
+# Install dependencies cleanly
+npm ci
+
+# Create your environment file from template
+cp .env.example .env
+```
+
+Ensure `.env` contains valid configuration:
 ```env
 PORT=3000
 NODE_ENV=development
-
-# PostgreSQL (matching docker-compose.yml)
 DATABASE_URL=postgresql://postgres:mysecretpassword@127.0.0.1:5433/my_database
-
-# Redis (matching docker-compose.yml)
 REDIS_URL=redis://localhost:6379
-
-# Auth
-JWT_SECRET=your-super-secret-jwt-key-with-sufficient-length
+JWT_SECRET=super-secret-jwt-key-with-at-least-32-characters-minimum
 JWT_EXPIRES_IN=15m
 JWT_REFRESH_EXPIRES_IN=7d
+STRIPE_SECRET_KEY=sk_test_placeholder
+STRIPE_WEBHOOK_SECRET=whsec_placeholder
 ```
 
-### 3. Start Infrastructure Services
-
+### 2. Database & Redis Setup
 ```bash
-docker compose up -d            # start PostgreSQL and Redis in background
-docker compose ps               # verify containers are running
-```
+# Start PostgreSQL (port 5433) and Redis (port 6379)
+docker compose up -d db cache
 
-Useful Docker maintenance commands:
-```bash
-docker compose logs -f db       # stream database logs
-docker compose exec db psql -U postgres -d my_database   # open postgres shell
-docker compose exec cache redis-cli                      # open redis CLI
-docker compose down             # stop containers (volumes preserved)
-```
+# Generate Prisma Client (Prisma 7 with pg adapter)
+npx prisma generate
 
-### 4. Database Migration & Prisma Setup
+# Apply migrations
+npm run migrate
 
-Prisma 7 uses a driver adapter (`@prisma/adapter-pg`) with database configuration defined in `prisma.config.ts`:
+npm run db:generate
 
-```bash
-npx prisma migrate dev --name init    # apply database migrations
-npx prisma generate                  # generate Prisma Client
-```
-
-### 5. Seed Test Admin User
-
-Create or update the test administrator account:
-
-```bash
-npm run seed:admin
-```
-
-**Default Test Credentials:**
-* **Email:** `admin@example.com`
-* **Password:** `AdminPassword123!`
-* **Role:** `ADMIN`
-
----
-
-## Running the Application
-
-### Development Mode
-```bash
 npm run dev
+
+npm run db:deploy
+
+# (Optional) Seed an Admin user for testing
+ADMIN_EMAIL=admin@example.com ADMIN_PASSWORD=AdminSecurePassword123! npm run seed:admin
 ```
-The server will start at `http://localhost:3000`.
 
-### Running Integration Tests
-All tests are implemented using the native test runner and TypeScript execution (`tsx --test`):
-
+### 3. Build & Run Application
 ```bash
-npm test
+# Static typecheck
+npm run typecheck
+
+# Production bundle (bundles server & worker to dist/ via esbuild)
+npm run build
+
+# Start API in development watch mode
+npm run dev
+
+# Start worker in a separate terminal
+npm run worker
 ```
 
-Test suites cover:
-* **RBAC & Admin Route (`src/tests/rbac-admin.test.ts`)**: 401 unauthenticated, 403 user forbidden, 200 admin allowed.
-* **Queue Abstraction (`src/tests/queue.test.ts`)**: Local queue adapter contract and `USER_REGISTERED` publishing post-commit.
-* **Redis Connection (`src/tests/redis.test.ts`)**: `SET health:redis ok` & `GET health:redis`.
-* **Health Checks (`src/tests/health.test.ts`)**: Liveness 200, Readiness 200 (healthy) & 503 (degraded).
-* **Swagger Documentation (`src/tests/swagger.test.ts`)**: OpenAPI schema and UI route availability.
+The server will start on `http://localhost:3000`.
+- **Health Live**: `GET http://localhost:3000/health/live`
+- **Health Ready**: `GET http://localhost:3000/health/ready`
+- **Swagger Documentation UI**: `http://localhost:3000/docs/`
+- **OpenAPI JSON Spec**: `GET http://localhost:3000/docs/json`
 
 ---
 
-## Project Structure
+## 🧪 Testing
 
-```text
-├── docker-compose.yml           # PostgreSQL & Redis container configuration
-├── prisma/
-│   ├── schema.prisma            # Database models & relationships
-│   └── migrations/              # SQL schema migration history
-├── prisma.config.ts             # Prisma 7 adapter configuration
-├── scripts/
-│   ├── seed-admin.ts            # Admin user database seed script
-│   └── test-api.ts              # API smoke test script
-├── src/
-│   ├── app.ts                   # Express application setup & middleware wiring
-│   ├── server.ts                # HTTP server bootstrap
-│   ├── config/
-│   │   ├── env.ts               # Zod-validated environment schema
-│   │   ├── prisma.ts            # PrismaClient instance with PG adapter
-│   │   └── redis.ts             # Redis connection manager & health checks
-│   ├── common/
-│   │   ├── logger.ts            # Pino structured JSON logger
-│   │   ├── token.ts             # JWT signing and verification
-│   │   └── queue/               # QueueService interface & LocalQueueService
-│   ├── errors/
-│   │   └── AppError.ts          # Operational error classes (400, 401, 403, 404, 409)
-│   ├── middlewares/
-│   │   ├── auth.ts              # authenticate() & authorize() RBAC middleware
-│   │   ├── rbac.ts              # RBAC re-export
-│   │   ├── requestId.ts         # Adds UUID x-request-id to requests & responses
-│   │   └── requestLogger.ts     # Logs inbound requests & status codes
-│   ├── docs/
-│   │   ├── swagger.ts           # Swagger UI router & OpenAPI definitions
-│   │   └── swagger.json         # OpenAPI 3.0 specification file
-│   ├── modules/
-│   │   ├── admin/               # Admin routes & controllers (GET /api/v1/admin/health)
-│   │   ├── auth/                # Auth routes, controllers, services, repositories
-│   │   ├── health/              # Liveness and Readiness probes (/health/live, /health/ready)
-│   │   └── user/                # User profile endpoints
-│   └── tests/                   # Integration & contract test suites
-└── tsconfig.json
+The test suite runs using Node's built-in test runner (`tsx --test`) with an in-memory stream harness (`testHelper.ts`) that runs seamlessly in sandboxed environments without requiring loopback network permissions:
+
+```bash
+# Run all unit, integration, and security tests
+NODE_ENV=test npm test
 ```
+
+### Verified Test Matrix
+- ✅ **Task 19 & 20**: RBAC Middleware & Admin Health Integration (401 unauthenticated, 403 USER forbidden, 200 ADMIN allowed).
+- ✅ **Task 21**: Redis Connection & Infrastructure Integration (`SET health:redis ok`, `GET health:redis`).
+- ✅ **Task 22 & 23**: Queue Abstraction & `USER_REGISTERED` post-commit event publishing.
+- ✅ **Task 24**: Liveness (process uptime) and Readiness (database + cache connectivity probes).
+- ✅ **Commerce Security**: Unsigned Stripe webhook rejection (401), Google OAuth query forgery rejection (401).
+- ✅ **Swagger API**: Interactive UI and OpenAPI 3.0 specification conformance.
+
+---
+
+## 📚 API Endpoints Summary
+
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/register` | Public | Register new customer; publishes `USER_REGISTERED` event |
+| `POST` | `/api/v1/auth/login` | Public | Authenticate credentials; returns access JWT and sets HttpOnly refresh cookie |
+| `POST` | `/api/v1/auth/refresh` | Public (Cookie) | Atomic single-use refresh token rotation |
+| `POST` | `/api/v1/auth/logout` | Authenticated | Revoke refresh token and clear cookie |
+| `GET` | `/api/v1/users/me` | Authenticated | Fetch current authenticated user profile |
+| `GET` | `/api/v1/products` | Public | Paginated product list with search and Redis caching |
+| `GET` | `/api/v1/products/:id` | Public | Single product details (cached with Redis cache-aside) |
+| `POST` | `/api/v1/products` | `ADMIN` | Create new product and inventory record; invalidates cache |
+| `PATCH` | `/api/v1/products/:id` | `ADMIN` | Update product details; invalidates cache |
+| `PATCH` | `/api/v1/products/:id/status` | `ADMIN` | Activate or deactivate product |
+| `POST` | `/api/v1/orders` | Authenticated | Atomically reserve inventory and create pending order |
+| `GET` | `/api/v1/orders` | Authenticated | List caller's orders (with pagination) |
+| `GET` | `/api/v1/orders/:id` | Owner or `ADMIN` | View order details and line item snapshots |
+| `POST` | `/api/v1/orders/:id/cancel` | Owner or `ADMIN` | Cancel order and release reserved inventory |
+| `POST` | `/api/v1/orders/:id/checkout` | Authenticated | Create Stripe Checkout session for pending order |
+| `GET` | `/api/v1/orders/:id/payment` | Owner or `ADMIN` | Inspect payment status for order |
+| `POST` | `/api/v1/webhooks/stripe` | Stripe Signature | Signature-verified idempotent Stripe webhook processor |
+| `GET` | `/health/live` | Public | Process liveness check |
+| `GET` | `/health/ready` | Public | Dependency readiness check (PostgreSQL & Redis) |
+| `GET` | `/docs` | Public | Interactive Swagger API documentation UI |
+| `GET` | `/docs/json` | Public | Raw OpenAPI 3.0 JSON specification |
+
+---
+
+## 📖 Systematic Documentation Index
+
+Detailed engineering guides are organized in the [`docs/`](docs/) directory:
+
+- 🏛️ **Architecture & Data**:
+  - [`docs/architecture/overview.md`](docs/architecture/overview.md) — Layered architectural flow and component responsibilities.
+  - [`docs/architecture/data-model.md`](docs/architecture/data-model.md) — Database schema, transaction boundaries, and index strategies.
+  - [`docs/architecture/decisions.md`](docs/architecture/decisions.md) — Architectural decision records (ADRs) explaining tradeoffs.
+- 🔐 **Security & Access Control**:
+  - [`docs/security/authentication.md`](docs/security/authentication.md) — Token hashing, atomic rotation, cookie transport, and Google OIDC.
+  - [`docs/security/rbac.md`](docs/security/rbac.md) — Role-based access control, resource ownership checks, and status guards.
+- ⚙️ **Infrastructure & Messaging**:
+  - [`docs/infrastructure/queue.md`](docs/infrastructure/queue.md) — BullMQ job processing and Transactional Outbox pattern.
+  - [`docs/infrastructure/redis.md`](docs/infrastructure/redis.md) — Redis cache-aside, key naming conventions, and failover behavior.
+  - [`docs/infrastructure/health-checks.md`](docs/infrastructure/health-checks.md) — Liveness and readiness probe semantics for container orchestrators.
+- 🛠️ **Operations & Runbooks**:
+  - [`docs/operations/development-guide.md`](docs/operations/development-guide.md) — Local development workflow and third-party credential setup.
+  - [`docs/operations/failure-scenarios.md`](docs/operations/failure-scenarios.md) — Disaster recovery: DB outage, Redis downtime, webhook replay, worker crashes.
+  - [`docs/operations/aws-deployment.md`](docs/operations/aws-deployment.md) — Production AWS ECS/Fargate + RDS + ElastiCache deployment runbook.
+  - [`docs/review/interview-guide.md`](docs/review/interview-guide.md) — System design interview prompts, Feynman-style explanations, and resume bullets.
+
+---
+
+## 📜 Key NPM Scripts
+
+| Script | Command | Purpose |
+|---|---|---|
+| `npm run dev` | `tsx watch src/server.ts` | Starts development server with live reload |
+| `npm run typecheck` | `tsc --noEmit` | Strict static type checking |
+| `npm run build` | `tsc --noEmit && esbuild ...` | Compiles and bundles API server & worker to `dist/` |
+| `npm start` | `node dist/server.js` | Runs compiled production API server |
+| `npm run worker` | `tsx src/workers/email.worker.ts` | Runs BullMQ email worker in development |
+| `npm run worker:prod` | `node dist/workers/email.worker.js` | Runs compiled production background worker |
+| `npm test` | `tsx --test src/tests/*.test.ts` | Executes full automated test suite |
+| `npm run migrate` | `prisma migrate dev` | Applies Prisma migrations |
+| `npm run seed:admin` | `tsx scripts/seed-admin.ts` | Seeds an admin user safely using environment variables |

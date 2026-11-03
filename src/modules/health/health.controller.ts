@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import { checkLiveness, checkReadiness } from "./health.service";
+import { checkLiveness, checkReadiness } from "./health.service.js";
 
 /**
  * Liveness Check: process is alive

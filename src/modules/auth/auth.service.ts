@@ -1,15 +1,21 @@
-import { findUserByEmail, createUser, createRefreshToken } from "./auth.repository";
-import { type LoginInput, type RegisterInput, type RefreshTokenInput } from "./auth.types";
-import { ConflictError, UnauthorizedError, BadRequestError } from "../../errors/AppError";
-import { logger } from "../../common/logger";
-import { generateAccessToken, generateRefreshToken } from "../../common/token";
-import { findRefreshToken, revokeRefreshToken, revokeAllUserTokens } from "./auth.repository";
-import { queueService, type QueueService } from "../../common/queue";
+import {
+  findUserByEmail,
+  createUser,
+  createRefreshToken,
+  rotateRefreshTokenAtomic,
+  revokeRefreshToken,
+} from "./auth.repository.js";
+import { type LoginInput, type RegisterInput, type RefreshTokenInput } from "./auth.types.js";
+import { ConflictError, UnauthorizedError } from "../../errors/AppError.js";
+import { logger } from "../../common/logger.js";
+import {
+  generateAccessToken,
+  generateOpaqueRefreshToken,
+} from "../../common/token.js";
+import { type QueueService } from "../../common/queue.js";
 import argon2 from "argon2";
-import crypto from "crypto";
+import { refreshTtlMs } from "./auth.cookies.js";
 
-const JWT_EXPIRES_IN = (process.env.JWT_ACCESS_EXPIRES_IN || "1h") as string;
-const JWT_REFRESH_EXPIRES_IN = parseInt(process.env.JWT_REFRESH_EXPIRES_IN || "7", 10);
 
 export interface RegisterDependencies {
   findUserByEmail?: typeof findUserByEmail;
@@ -21,12 +27,13 @@ export async function registerUser(
   input: RegisterInput,
   deps: RegisterDependencies = {},
 ) {
-  const { email, password } = input;
+  const email = input.email.toLowerCase().trim();
+  const password = input.password;
   const findUser = deps.findUserByEmail ?? findUserByEmail;
   const create = deps.createUser ?? createUser;
-  const queue = deps.queue ?? queueService;
+  const queue = deps.queue;
 
-  logger.info({ email }, "Checking if user exists");
+  logger.info({ email }, "Processing user registration");
 
   // Check if email already exists
   const existingUser = await findUser(email);
@@ -40,13 +47,12 @@ export async function registerUser(
     password,
   });
 
-  logger.info({ userId: user.id, email: user.email }, "User created successfully");
+  logger.info({ userId: user.id, email: user.email }, "User registered successfully in database");
 
   // Publish USER_REGISTERED event only after DB transaction is committed
-  await queue.publish("USER_REGISTERED", {
-    userId: user.id,
-    email: user.email,
-  });
+  // Real registrations emit an event transactionally via the repository's outbox.
+  // Explicit queue injection is retained for isolated unit tests.
+  if (queue) await queue.publish("USER_REGISTERED", { userId: user.id, email: user.email });
 
   return {
     id: user.id,
@@ -57,17 +63,24 @@ export async function registerUser(
 }
 
 export async function loginUser(input: LoginInput) {
-  const { email, password } = input;
+  const email = input.email.toLowerCase().trim();
+  const { password } = input;
 
-  logger.info({ email }, "Check Email exists");
+  logger.info({ email }, "Processing user login attempt");
 
-  // Check if email exists
   const userExists = await findUserByEmail(email);
   if (!userExists) {
     throw new UnauthorizedError("Invalid email or password");
   }
 
-  const isPasswordValid = await argon2.verify(userExists.passwordHash || "", password);
+  if (userExists.status === "DISABLED") {
+    throw new UnauthorizedError("Invalid email or password");
+  }
+
+  // Social-only accounts have no password; do not call argon2 with an empty hash.
+  const isPasswordValid = userExists.passwordHash
+    ? await argon2.verify(userExists.passwordHash, password)
+    : false;
   if (!isPasswordValid) {
     throw new UnauthorizedError("Invalid email or password");
   }
@@ -80,50 +93,44 @@ export async function loginUser(input: LoginInput) {
     roles,
   });
 
-  const tokenString = crypto.randomBytes(40).toString("hex");
+  // Generate opaque refresh token
+  const refreshToken = generateOpaqueRefreshToken();
   const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + JWT_REFRESH_EXPIRES_IN);
+  expiresAt.setTime(Date.now() + refreshTtlMs());
 
-  await createRefreshToken(tokenString, userExists.id, expiresAt);
+  await createRefreshToken(refreshToken, userExists.id, expiresAt);
 
   return {
     accessToken,
-    refreshToken: tokenString,
+    refreshToken,
     user: {
       id: userExists.id,
       email: userExists.email,
+      roles,
     },
   };
 }
 
 export async function refreshAccessToken(input: RefreshTokenInput) {
   const { refreshToken } = input;
-
-  // Find valid refresh token in DB
-  const storedToken = await findRefreshToken(refreshToken);
-
-  if (!storedToken) {
-    throw new UnauthorizedError("Invalid or expired refresh token");
+  if (!refreshToken) {
+    throw new UnauthorizedError("Refresh token missing");
   }
 
-  // Revoke old refresh token (token rotation for security)
-  await revokeRefreshToken(refreshToken);
+  const newRefreshToken = generateOpaqueRefreshToken();
+  const newExpiresAt = new Date();
+  newExpiresAt.setTime(Date.now() + refreshTtlMs());
 
-  // Generate new tokens
-  const user = storedToken.user;
-  const roles = user.roles?.map((ur) => ur.role.name) || [];
+  // Atomically rotate refresh token in single DB transaction
+  const user = await rotateRefreshTokenAtomic(refreshToken, newRefreshToken, newExpiresAt);
+
+  const roles = user.roles.map((ur) => ur.role.name);
+
   const newAccessToken = generateAccessToken({
     userId: user.id,
     email: user.email,
     roles,
   });
-
-  // Generate new refresh token
-  const newRefreshToken = generateRefreshToken();
-  const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + JWT_REFRESH_EXPIRES_IN);
-
-  await createRefreshToken(newRefreshToken, user.id, expiresAt);
 
   return {
     accessToken: newAccessToken,
@@ -131,7 +138,8 @@ export async function refreshAccessToken(input: RefreshTokenInput) {
   };
 }
 
-export async function logoutUser(userId: string) {
-  await revokeAllUserTokens(userId);
+export async function logoutUser(refreshToken?: string) {
+  // Logout is limited to the presented refresh session, not every user session.
+  if (refreshToken) await revokeRefreshToken(refreshToken);
   return { message: "Logged out successfully" };
 }

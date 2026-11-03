@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { redisClient, connectRedis, disconnectRedis, testRedisConnection } from "../config/redis";
+import { redisClient, connectRedis, disconnectRedis, testRedisConnection } from "../config/redis.js";
 
 describe("Task 21: Redis Connection & Infrastructure Integration", () => {
   it("exports redisClient, connectRedis, disconnectRedis, and testRedisConnection", () => {

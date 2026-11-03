@@ -1,90 +1,93 @@
-# Architecture Overview
+# Architecture overview
 
-This document describes the high-level architecture, design principles, and component interactions of the application.
+## Responsibility layers
 
----
-
-## 1. Architectural Principles
-
-The application is structured following **Clean Architecture** and **Layered Architecture** principles:
-
-1. **Separation of Concerns**:
-   * **Presentation Layer** (`routes`, `middlewares`): HTTP routing, request parsing, authentication verification, and RBAC authorization.
-   * **Application / Controller Layer** (`controller`): HTTP parameter extraction, delegating business logic to services, and response formatting.
-   * **Domain / Business Layer** (`service`): Business rules, validation, transaction orchestration, domain event publishing.
-   * **Data Access Layer** (`repository`): Database queries, transactions, and persistence using Prisma Client.
-   * **Infrastructure Layer** (`config`, `common`): Database adapters, Redis client, logger, and message queues.
-
-2. **Dependency Inversion**:
-   * High-level modules do not depend on low-level implementation details.
-   * Infrastructure dependencies like `QueueService` are abstracted behind TypeScript interfaces to allow swapping local adapters with cloud services (e.g. AWS SQS) without modifying business logic.
-
----
-
-## 2. Request Lifecycle Pipeline
+HTTP requests pass through security headers, CORS, cookie parsing, correlation ID, request logging, raw Stripe body parser where applicable, bounded JSON parser and the routed controller. Domain services enforce business rules. Prisma repositories own DB access; Redis is a cache, not the source of truth. Workers are independently started. The code is **modular layered architecture**, not isolated microservices.
 
 ```mermaid
 flowchart TD
-    Client["Client Request"] --> Ingress["Express App (app.ts)"]
-
-    subgraph Pipeline["Global Middleware Pipeline"]
-        Ingress --> ReqId["requestIdMiddleware\n(Generates & attaches x-request-id)"]
-        ReqId --> ReqLog["requestLoggerMiddleware\n(Structured logging via Pino)"]
-        ReqLog --> BodyParse["Body Parsers\n(express.json & urlencoded)"]
-    end
-
-    subgraph Routing["Routing & Security Handlers"]
-        BodyParse --> RouteSelect{"Route Matching"}
-        RouteSelect -- "/health/*" --> HealthRoute["Health Module\n(No Auth)"]
-        RouteSelect -- "/docs" --> SwaggerRoute["Swagger UI\n(No Auth)"]
-        RouteSelect -- "/api/v1/auth/*" --> AuthRoute["Auth Module\n(Public / Token-based)"]
-        RouteSelect -- "/api/v1/admin/*" --> AdminRoute["Admin Module\n(Auth & RBAC Protected)"]
-
-        AdminRoute --> AuthMid["authenticate()\n(Verify Bearer JWT)"]
-        AuthMid --> RBACMid["authorize('ADMIN')\n(Verify User Role)"]
-        RBACMid --> AdminCtrl["Admin Controller"]
-    end
-
-    subgraph ErrorHandling["Centralized Error Handling"]
-        AdminCtrl -.->|Error Thrown| GlobalErr["Global Error Handler (app.ts)"]
-        AuthMid -.->|401 Thrown| GlobalErr
-        RBACMid -.->|403 Thrown| GlobalErr
-        GlobalErr --> JSONErr["Structured JSON Error Response"]
-    end
+    Client["Client / Postman"] --> Express["Express 5 API"]
+    Express --> Guards["JWT + DB status/RBAC + Zod validation"]
+    Guards --> Controllers["Controllers"]
+    Controllers --> Services["Auth / Products / Orders / Payment services"]
+    Services --> Repos["Prisma repositories"]
+    Repos --> PG[("PostgreSQL")]
+    Services --> Cache[("Redis cache")]
+    Repos --> Outbox[("OutboxEvent rows")]
+    Outbox --> Poller["Outbox poller (worker process)"]
+    Poller --> BullMQ["BullMQ in Redis"]
+    BullMQ --> Worker["Email worker"]
+    Worker --> Sim["Simulated log OR configured email HTTP adapter"]
+    Services --> Stripe["Stripe Checkout API"]
+    Stripe --> Signed["Signed raw-body webhook"]
+    Signed --> Services
+    Google["Google OAuth + JWKS"] --> Guards
 ```
 
----
+## Creation/reservation transaction
 
-## 3. Technology Stack & Rationale
-
-| Component | Technology | Rationale |
-| :--- | :--- | :--- |
-| **Runtime & Language** | Node.js (v20+) & TypeScript | Static type safety, modern ECMAScript module support, and native test runner. |
-| **HTTP Framework** | Express 5 | Improved async error handling, modern routing capabilities, and widespread ecosystem compatibility. |
-| **ORM / Database Driver** | Prisma 7 (`@prisma/adapter-pg`) | Type-safe schema definition, automated SQL migrations, and driver adapter architecture. |
-| **Database** | PostgreSQL 16 | ACID-compliant relational storage, foreign key constraints, and transactional consistency. |
-| **In-Memory Cache** | Redis 7 (`redis` v6+) | Low-latency caching, session state management, and infrastructure readiness probes. |
-| **Password Hashing** | Argon2 (`argon2`) | Winner of the Password Hashing Competition; resistant to GPU and side-channel cracking. |
-| **Token Authentication** | JSON Web Tokens (`jsonwebtoken`) | Stateless authentication with signed role claims and tamper resistance. |
-| **Logging** | Pino (`pino`, `pino-pretty`) | Extremely fast, structured JSON logging with request correlation IDs. |
-| **API Documentation** | Swagger UI (`swagger-ui-express`) | Standardized OpenAPI 3.0 specification with interactive testing. |
-
----
-
-## 4. Cross-Cutting Concerns
-
-### Request Correlation ID (`x-request-id`)
-Every incoming HTTP request is assigned a unique UUID via [`requestIdMiddleware`](../../src/middlewares/requestId.ts). This ID is:
-1. Attached to the request object (`req.requestId`).
-2. Appended to the response headers (`x-request-id`).
-3. Included in all Pino log entries for tracing distributed requests.
-
-### Centralized Error Handling
-Errors inherit from [`AppError`](../../src/errors/AppError.ts) (`statusCode`, `code`, `isOperational`, `details`). Non-operational errors are logged as critical errors while operational errors return consistent JSON responses:
-
-```json
-{
-  "code": "FORBIDDEN",
-  "message": "Access forbidden: insufficient permissions"
-}
+```mermaid
+sequenceDiagram
+    participant U as Authenticated user
+    participant A as Orders API
+    participant DB as PostgreSQL
+    participant W as Worker
+    U->>A: POST /api/v1/orders {items}
+    A->>DB: BEGIN
+    loop For each item
+      A->>DB: Conditional UPDATE inventory (available >= quantity)
+      DB-->>A: affected row count
+    end
+    A->>DB: Create order + price snapshots + outbox event
+    A->>DB: COMMIT
+    A-->>U: Pending order
+    W->>DB: Read unpublished outbox rows
+    W->>W: Add job to BullMQ; mark outbox published
 ```
+
+## Checkout and signed webhook
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant Stripe
+    participant DB as PostgreSQL
+    participant Worker
+    User->>API: POST /orders/:id/checkout
+    API->>DB: Check order owner, status, expiry
+    API->>Stripe: Create card-only Checkout (idempotency key)
+    Stripe-->>API: session id and url
+    API->>DB: Store bound pending payment
+    API-->>User: Checkout URL
+    User->>Stripe: Pay by card
+    Stripe->>API: checkout.session.completed + signature
+    API->>API: Verify raw-body signature + payment_status paid
+    API->>DB: BEGIN + unique provider event insert
+    API->>DB: Verify session, amount, currency, order state
+    API->>DB: Conditional PAID transition + decrement reserved inventory
+    API->>DB: Update payment + insert outbox event + COMMIT
+    API-->>Stripe: 200 acknowledgment
+    Worker->>DB: Deliver committed outbox to BullMQ
+```
+
+### State guarantees and limitations
+
+- Pending order creation and stock reservation are atomic in PostgreSQL.
+- Checkout uses server-side price snapshots and single-purpose card payment flow.
+- Webhook event uniqueness and a conditional order transition prevent duplicate inventory finalization.
+- A genuine paid event for a **cancelled/expired** order fails with a reconciliation-required conflict, rather than silently restocking/confirming. Such cases require operations support.
+- Cancellation is rejected after a Checkout has begun, until the external payment state can be reconciled.
+- The outbox protects against losing the **enqueue request** when the API commits but Redis is offline. It does not itself guarantee exactly-once email delivery.
+- Redis failures should not invalidate PostgreSQL reads/writes where cache use is optional.
+
+### Directory guide
+
+- `src/modules/auth`: identity, session rotation, Google flow
+- `src/modules/products`: Zod input, product CRUD, cache use
+- `src/modules/orders`: stock reservation, order access/cancellation
+- `src/modules/payments`: Checkout and webhook event processing
+- `src/common/cache`: cache-aside and invalidation
+- `src/common/queue`: BullMQ adapter and outbox poller
+- `src/workers/email.worker.ts`: queued email simulation or configured HTTP transport
+- `src/middlewares`: auth, RBAC, request ID, logger, rate limiting

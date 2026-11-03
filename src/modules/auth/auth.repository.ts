@@ -1,12 +1,25 @@
-import { prisma } from "../../config/prisma";
-import { type RegisterInput } from "./auth.types";
-import { ConflictError } from "../../errors/AppError";
+import { prisma } from "../../config/prisma.js";
+import { type RegisterInput } from "./auth.types.js";
+import { ConflictError, UnauthorizedError } from "../../errors/AppError.js";
+import { hashToken } from "../../common/token.js";
 import argon2 from "argon2";
-import { logger } from "../../common/logger";
+import { Prisma } from "@prisma/client";
+import { logger } from "../../common/logger.js";
 
 export async function findUserByEmail(email: string) {
   return prisma.user.findUnique({
-    where: { email },
+    where: { email: email.toLowerCase().trim() },
+    include: {
+      roles: {
+        include: { role: true },
+      },
+    },
+  });
+}
+
+export async function findUserById(id: string) {
+  return prisma.user.findUnique({
+    where: { id },
     include: {
       roles: {
         include: { role: true },
@@ -16,35 +29,30 @@ export async function findUserByEmail(email: string) {
 }
 
 export async function createUser(data: RegisterInput & { password: string }) {
+  const normalizedEmail = data.email.toLowerCase().trim();
+
   // Get or create default USER role
-  let role = await prisma.role.findUnique({
+  const role = await prisma.role.upsert({
     where: { name: "USER" },
+    update: {}, create: { name: "USER" },
   });
 
-  if (!role) {
-    role = await prisma.role.create({
-      data: { name: "USER" },
-    });
-  }
+  // Pre-hash password before database transaction to avoid holding DB connection
+  const passwordHash = await argon2.hash(data.password);
 
   // Create user with role in a transaction
   return prisma.$transaction(async (tx) => {
-    // Check if email already exists
     const existingUser = await tx.user.findUnique({
-      where: { email: data.email },
+      where: { email: normalizedEmail },
     });
 
     if (existingUser) {
       throw new ConflictError("Email already registered");
     }
 
-    // Hash password
-    const passwordHash = await argon2.hash(data.password);
-
-    // Create user
     const user = await tx.user.create({
       data: {
-        email: data.email,
+        email: normalizedEmail,
         passwordHash,
         roles: {
           create: {
@@ -59,67 +67,100 @@ export async function createUser(data: RegisterInput & { password: string }) {
       },
     });
 
+    await tx.outboxEvent.create({ data: {
+      sourceId: `user:${user.id}:registered`, eventType: "USER_REGISTERED",
+      payload: { userId: user.id, email: user.email },
+    } });
     return user;
+  }).catch((err: unknown) => {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      throw new ConflictError("Email already registered");
+    }
+    throw err;
   });
 }
 
-export async function getUserWithRoles(userId: string) {
-  const user = await prisma.user.findUnique({
-    where: {
-      id: userId,
-    },
-    include: {
-      roles: true,
-      // userRoles:{
-      //   include:{
-      //     role:true
-      //   }
-      // }
-    },
-  });
-  return user;
-}
-
+/**
+ * Stores a hashed refresh token in the database.
+ */
 export async function createRefreshToken(
-  token: string,
+  rawToken: string,
   userId: string,
-  expiresAt: any,
+  expiresAt: Date,
 ) {
-  const data = await prisma.refreshToken.create({
+  const tokenHash = hashToken(rawToken);
+  return prisma.refreshToken.create({
     data: {
       userId,
-      tokenHash: token,
-      expiresAt: expiresAt,
+      tokenHash,
+      expiresAt,
     },
   });
-  logger.info(data,"Tokendata")
-
-  return data
 }
-export async function findRefreshToken(token: string) {
-  return prisma.refreshToken.findFirst({
-    where: {
-      tokenHash: token,
-      revokedAt: null,
-      expiresAt: {
-        gt: new Date(),
-      },
-    },
-    include: {
-      user: {
-        include: {
-          roles: {
-            include: { role: true },
+
+/**
+ * Atomically consumes an old refresh token and issues a new refresh token in a single transaction.
+ * Guarantees that concurrent requests using the same old token cannot both succeed.
+ */
+export async function rotateRefreshTokenAtomic(
+  oldRawToken: string,
+  newRawToken: string,
+  newExpiresAt: Date,
+) {
+  const oldHash = hashToken(oldRawToken);
+  const newHash = hashToken(newRawToken);
+
+  return prisma.$transaction(async (tx) => {
+    // 1. Look up valid, active refresh token
+    const storedToken = await tx.refreshToken.findUnique({
+      where: { tokenHash: oldHash },
+      include: {
+        user: {
+          include: {
+            roles: {
+              include: { role: true },
+            },
           },
         },
       },
-    },
+    });
+
+    if (!storedToken || storedToken.revokedAt || storedToken.expiresAt <= new Date()) {
+      throw new UnauthorizedError("Invalid or expired refresh token");
+    }
+
+    // Check account status
+    if (storedToken.user.status === "DISABLED") {
+      throw new UnauthorizedError("Account has been disabled");
+    }
+
+    // 2. Atomically revoke old token
+    const now = new Date();
+    const consumed = await tx.refreshToken.updateMany({
+      where: { id: storedToken.id, revokedAt: null, expiresAt: { gt: now } },
+      data: { revokedAt: now },
+    });
+    if (consumed.count !== 1) {
+      throw new UnauthorizedError("Refresh token already consumed");
+    }
+
+    // 3. Persist new hashed refresh token
+    await tx.refreshToken.create({
+      data: {
+        userId: storedToken.userId,
+        tokenHash: newHash,
+        expiresAt: newExpiresAt,
+      },
+    });
+
+    return storedToken.user;
   });
 }
 
-export async function revokeRefreshToken(token: string) {
+export async function revokeRefreshToken(rawToken: string) {
+  const tokenHash = hashToken(rawToken);
   return prisma.refreshToken.updateMany({
-    where: { tokenHash: token },
+    where: { tokenHash },
     data: { revokedAt: new Date() },
   });
 }

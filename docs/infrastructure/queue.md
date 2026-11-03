@@ -1,131 +1,29 @@
-# Queue Abstraction & Event Publishing
+# Transactional outbox + BullMQ + email worker
 
-This document details the implementation of **Task 22 (Queue Abstraction)** and **Task 23 (Publish USER_REGISTERED)**.
-
----
-
-## 1. Dependency Abstraction: `QueueService`
-
-To decouple business logic from messaging infrastructure (RabbitMQ, AWS SQS, Redis BullMQ), a generic interface is defined at [`src/common/queue/queue.interface.ts`](../../src/common/queue/queue.interface.ts):
-
-```ts
-export interface QueueService {
-  publish(eventName: string, payload: unknown): Promise<void>;
-}
-```
-
----
-
-## 2. Local Adapter (`LocalQueueService`)
-
-The default adapter [`LocalQueueService`](../../src/common/queue/localQueue.service.ts) logs events using Pino structured logging and maintains an in-memory history for testing:
-
-```ts
-export class LocalQueueService implements QueueService {
-  private events: PublishedEvent[] = [];
-
-  async publish(eventName: string, payload: unknown): Promise<void> {
-    const event: PublishedEvent = {
-      eventName,
-      payload,
-      timestamp: new Date(),
-    };
-    this.events.push(event);
-
-    logger.info(
-      { eventName, payload },
-      `[LocalQueueService] Event published: ${eventName}`,
-    );
-  }
-
-  getEvents(): PublishedEvent[] {
-    return [...this.events];
-  }
-
-  getEventsByName(eventName: string): PublishedEvent[] {
-    return this.events.filter((e) => e.eventName === eventName);
-  }
-
-  clear(): void {
-    this.events = [];
-  }
-}
-```
-
----
-
-## 3. Transaction Guarantee: Post-Commit Publishing (Task 23)
-
-### The Problem
-Publishing domain events *before* database commit creates race conditions: if the database transaction fails (e.g. duplicate email, unique constraint failure), listeners (welcome email workers, analytics services) might process an event for a record that does not exist.
-
-### The Solution
-The event is dispatched **strictly after** the database transaction completes:
+Real code: `src/common/queue/bullmqQueue.service.ts`, `outbox.service.ts`, `src/workers/email.worker.ts`, Prisma `OutboxEvent`.
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant App as registerUser()
-    participant DB as PostgreSQL Transaction
-    participant Queue as QueueService
-
-    App->>DB: BEGIN Transaction
-    App->>DB: INSERT User & UserRole
-    alt Transaction Fails
-        DB-->>App: ROLLBACK (ConflictError / Constraint Error)
-        Note over App,Queue: Queue publish is NEVER called!
-        App-->>App: Throw Error (Exit early)
-    else Transaction Succeeds
-        DB-->>App: COMMIT Successful
-        Note over App,Queue: Safe to publish event!
-        App->>Queue: publish("USER_REGISTERED", { userId, email })
-        Queue-->>App: Completed
-    end
+flowchart TD
+  Business[Order/user/payment DB transaction] --> Outbox[(PostgreSQL OutboxEvent)]
+  Outbox --> Poll[Worker polls unpublished rows]
+  Poll --> Queue[BullMQ in Redis]
+  Queue --> Email[Email worker]
+  Email -->|Dev| Log[SIMULATED EMAIL ONLY]
+  Email -->|Configured| Adapter[External HTTP email adapter]
+  Poll -->|Redis down| Retry[Leave event unpublished; retry later]
 ```
 
-### Implementation (`src/modules/auth/auth.service.ts`)
-```ts
-// 1. Transaction commits inside createUser repository call
-const user = await create({ email, password });
+Outbox events:
 
-// 2. Publish domain event only after DB transaction is committed
-await queue.publish("USER_REGISTERED", {
-  userId: user.id,
-  email: user.email,
-});
-```
+- `USER_REGISTERED` — written in user-creation transaction.
+- `ORDER_CREATED` — written in inventory/order transaction.
+- `PAYMENT_CONFIRMED` — written in verified webhook transaction.
 
-### Event Payload Schema
-```json
-{
-  "userId": "123e4567-e89b-12d3-a456-426614174000",
-  "email": "user@example.com"
-}
-```
+The worker polls about every 3 seconds. It publishes a BullMQ job using **outbox ID as jobId**, then sets `publishedAt` and increments attempts. Failed publishes remain unpublished. Worker jobs use bounded retries and exponential backoff. A crash after enqueue but before publishedAt can produce a duplicate; this is an **at-least-once** system, not exactly-once delivery.
 
----
+Email modes:
 
-## 4. Future Cloud Migration (Local Adapter $\rightarrow$ AWS SQS)
+- `EMAIL_TRANSPORT=log` (default): safe for learning; does **not send** messages. In production it fails rather than claim a real send.
+- `EMAIL_TRANSPORT=webhook`: sends JSON `{to,subject,text}` to the configured `EMAIL_API_URL` using bearer `EMAIL_API_KEY` and an `Idempotency-Key` header. Your provider adapter must be configured, secured and tested; no vendor-specific implementation is bundled.
 
-Because of the `QueueService` abstraction, switching to AWS SQS requires **zero changes** to business logic in `auth.service.ts`:
-
-```ts
-// Example: src/common/queue/sqsQueue.service.ts
-import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
-import type { QueueService } from "./queue.interface";
-
-export class SqsQueueService implements QueueService {
-  constructor(private client: SQSClient, private queueUrl: string) {}
-
-  async publish(eventName: string, payload: unknown): Promise<void> {
-    await this.client.send(new SendMessageCommand({
-      QueueUrl: this.queueUrl,
-      MessageBody: JSON.stringify({ eventName, payload }),
-      MessageAttributes: {
-        EventType: { DataType: "String", StringValue: eventName }
-      }
-    }));
-  }
-}
-```
-Simply export `new SqsQueueService(...)` in place of `localQueueService`.
+Operational gaps: there is no provider-level delivery receipt/history, dead-letter reconciliation dashboard or retention cleanup yet. Deploy both API and worker; starting the API alone won't drain outbox records. Redis downtime does not undo committed PostgreSQL orders/payments.

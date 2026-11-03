@@ -1,6 +1,6 @@
-import { prisma } from "../../config/prisma";
-import { redisClient, connectRedis } from "../../config/redis";
-import { logger } from "../../common/logger";
+import { prisma } from "../../config/prisma.js";
+import { redisClient, connectRedis } from "../../config/redis.js";
+import { logger } from "../../common/logger.js";
 
 export interface CheckDetail {
   status: "up" | "down";
@@ -77,12 +77,12 @@ export async function checkReadiness(): Promise<ReadinessResult> {
         database: {
           status: dbStatus,
           latencyMs: dbLatency,
-          ...(dbError ? { error: dbError } : {}),
+          ...(dbError ? { error: "Dependency unavailable" } : {}),
         },
         redis: {
           status: redisStatus,
           latencyMs: redisLatency,
-          ...(redisError ? { error: redisError } : {}),
+          ...(redisError ? { error: "Dependency unavailable" } : {}),
         },
       },
       timestamp: new Date().toISOString(),

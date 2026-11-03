@@ -1,5 +1,5 @@
-import type { QueueService } from "./queue.interface";
-import { logger } from "../logger";
+import type { QueueService } from "./queue.interface.js";
+import { logger } from "../logger.js";
 
 export interface PublishedEvent {
   eventName: string;
@@ -23,7 +23,7 @@ export class LocalQueueService implements QueueService {
     this.events.push(event);
 
     logger.info(
-      { eventName, payload },
+      { eventName },
       `[LocalQueueService] Event published: ${eventName}`,
     );
   }

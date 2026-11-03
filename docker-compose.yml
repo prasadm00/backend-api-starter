@@ -1,26 +1,61 @@
+# Local development only. Do not publish database or Redis ports in production.
 services:
   db:
     image: postgres:16
-    container_name: postgres-db
-    restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_password}
       POSTGRES_DB: my_database
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d my_database"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
   cache:
-    image: redis:latest
-    container_name: redis-cache
-    restart: unless-stopped
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
-
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/my_database
+      REDIS_URL: redis://cache:6379
+      PORT: 3000
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+  worker:
+    build: .
+    command: ["node", "dist/workers/email.worker.js"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/my_database
+      REDIS_URL: redis://cache:6379
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_healthy }
+    restart: unless-stopped
 volumes:
-  redis_data:
   pgdata:
+  redis_data:

@@ -1,21 +1,36 @@
-import express from "express";
+import { Router } from "express";
 import {
   loginUser,
   registerUser,
   refreshAccessToken,
   logoutUser,
-} from "./auth.controller";
+} from "./auth.controller.js";
 import {
   validateUserLogin,
   validateUserRegister,
-  validateRefreshToken,
-} from "./auth.validate";
+} from "./auth.validate.js";
+import {
+  googleAuthUrlHandler,
+  googleCallbackHandler,
+  googleLinkStartHandler,
+} from "./google.controller.js";
+import { authenticate } from "../../middlewares/auth.js";
+import { getMe } from "../user/user.controller.js";
+import { authRateLimit } from "../../middlewares/authRateLimit.js";
 
-const router = express.Router();
+const router = Router();
 
-router.post("/register", validateUserRegister, registerUser);
-router.post("/login", validateUserLogin, loginUser);
-router.post("/refresh", validateRefreshToken, refreshAccessToken);
+router.post("/register", authRateLimit, validateUserRegister, registerUser);
+router.post("/login", authRateLimit, validateUserLogin, loginUser);
+router.post("/refresh", authRateLimit, refreshAccessToken);
 router.post("/logout", logoutUser);
+
+// Profile endpoint alias
+router.get("/me", authenticate, getMe);
+
+// Google OAuth endpoints
+router.get("/google", googleAuthUrlHandler);
+router.get("/google/callback", googleCallbackHandler);
+router.get("/google/link", authenticate, googleLinkStartHandler);
 
 export default router;
