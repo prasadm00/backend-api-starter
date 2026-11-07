@@ -1,0 +1,3 @@
+# Files in .gitignore (node_modules, dist, .history, .env, ...) are already ignored.
+package-lock.json
+prisma/migrations/

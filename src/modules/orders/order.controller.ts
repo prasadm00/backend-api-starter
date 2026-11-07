@@ -7,6 +7,20 @@ import {
 } from "./order.service.js";
 import type { CreateOrderInput, OrderQueryInput } from "./order.types.js";
 
+/*
+ * Order controllers.
+ *
+ * Thin HTTP layer (routes -> validate -> controller -> service -> repository): read
+ * the request, call the service, shape the response. Business rules live in
+ * `order.service.ts`. Errors are not caught here; the global error handler turns
+ * thrown `AppError`s into JSON responses.
+ */
+
+/**
+ * POST /orders
+ *
+ * Creates an order from the validated body and reserves stock. Responds 201.
+ */
 export async function createOrderHandler(req: Request, res: Response) {
   const user = req.user as any;
   const userId = user?.userId || user?.sub;
@@ -21,6 +35,11 @@ export async function createOrderHandler(req: Request, res: Response) {
   });
 }
 
+/**
+ * GET /orders/:id
+ *
+ * Returns one order. Roles are passed on so the service can allow ADMIN to read any order.
+ */
 export async function getOrderHandler(req: Request, res: Response) {
   const user = req.user as any;
   const userId = user?.userId || user?.sub;
@@ -35,6 +54,12 @@ export async function getOrderHandler(req: Request, res: Response) {
   });
 }
 
+/**
+ * GET /orders
+ *
+ * Lists the caller's own orders with pagination. Reads `req.validatedQuery`, which
+ * `validateOrderQuery` filled with coerced, defaulted values.
+ */
 export async function listOrdersHandler(req: Request, res: Response) {
   const user = req.user as any;
   const userId = user?.userId || user?.sub;
@@ -49,6 +74,11 @@ export async function listOrdersHandler(req: Request, res: Response) {
   });
 }
 
+/**
+ * POST /orders/:id/cancel
+ *
+ * Cancels an order and releases its reserved stock. Owner or ADMIN only (enforced downstream).
+ */
 export async function cancelOrderHandler(req: Request, res: Response) {
   const user = req.user as any;
   const userId = user?.userId || user?.sub;

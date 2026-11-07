@@ -1,6 +1,12 @@
 import type { Request, Response } from "express";
 import { checkLiveness, checkReadiness } from "./health.service.js";
 
+/*
+ * Health controllers: map probe results to HTTP responses (routes -> controller -> service).
+ * Two probes exist because they answer different questions: "is the process alive?"
+ * (restart it if not) versus "can it serve traffic now?" (stop routing to it if not).
+ */
+
 /**
  * Liveness Check: process is alive
  * Returns 200 if server process is running.

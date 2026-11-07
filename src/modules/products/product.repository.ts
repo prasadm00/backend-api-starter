@@ -1,7 +1,23 @@
 import { prisma } from "../../config/prisma.js";
-import type { CreateProductInput, UpdateProductInput, ProductQueryInput } from "./product.types.js";
+import type {
+  CreateProductInput,
+  UpdateProductInput,
+  ProductQueryInput,
+} from "./product.types.js";
 import { Prisma } from "@prisma/client";
 
+/*
+ * Product repository (database layer).
+ *
+ * Flow: routes -> validate -> controller -> service -> repository.
+ * Plain Prisma access; caching and "not found" decisions are made in the service.
+ */
+
+/**
+ * Inserts a product and its inventory row in a single nested write.
+ *
+ * @returns The created product including `inventory`.
+ */
 export async function createProductWithInventory(
   data: CreateProductInput,
   createdBy: string,
@@ -30,6 +46,11 @@ export async function createProductWithInventory(
   });
 }
 
+/**
+ * Loads a product with its inventory.
+ *
+ * @returns The product, or `null` when it doesn't exist.
+ */
 export async function findProductById(id: string) {
   return prisma.product.findUnique({
     where: { id },
@@ -39,6 +60,12 @@ export async function findProductById(id: string) {
   });
 }
 
+/**
+ * Returns one page of products, optionally filtered by status and a case-insensitive
+ * name/description search, plus pagination metadata.
+ *
+ * @returns `{ products, pagination }`; `totalPages` is at least 1 even when empty.
+ */
 export async function listProducts(query: ProductQueryInput) {
   const { page, limit, status, search, sortBy, sortOrder } = query;
   const skip = (page - 1) * limit;
@@ -61,7 +88,12 @@ export async function listProducts(query: ProductQueryInput) {
       where,
       skip,
       take: limit,
-      orderBy: [{ [sortBy]: sortOrder } as Prisma.ProductOrderByWithRelationInput, { id: "asc" }],
+      // `id` is a tie-breaker: sort fields like price or name can repeat, and without a
+      // unique secondary key rows could shift between pages.
+      orderBy: [
+        { [sortBy]: sortOrder } as Prisma.ProductOrderByWithRelationInput,
+        { id: "asc" },
+      ],
       include: {
         inventory: true,
       },
@@ -80,13 +112,23 @@ export async function listProducts(query: ProductQueryInput) {
   };
 }
 
+/**
+ * Applies a partial update to a product and, if `stock` is given, to its inventory.
+ *
+ * Both writes share one transaction so the product and its stock change together.
+ * Only fields that are present in `data` are written.
+ *
+ * @returns The updated product including `inventory`.
+ */
 export async function updateProduct(id: string, data: UpdateProductInput) {
   return prisma.$transaction(async (tx) => {
     const updateData: Prisma.ProductUpdateInput = {};
 
     if (data.name !== undefined) updateData.name = data.name;
-    if (data.description !== undefined) updateData.description = data.description;
-    if (data.price !== undefined) updateData.price = new Prisma.Decimal(data.price);
+    if (data.description !== undefined)
+      updateData.description = data.description;
+    if (data.price !== undefined)
+      updateData.price = new Prisma.Decimal(data.price);
     if (data.currency !== undefined) updateData.currency = data.currency;
 
     if (data.stock !== undefined) {
@@ -114,7 +156,15 @@ export async function updateProduct(id: string, data: UpdateProductInput) {
   });
 }
 
-export async function updateProductStatus(id: string, status: "ACTIVE" | "INACTIVE") {
+/**
+ * Sets a product's status.
+ *
+ * @returns The updated product including `inventory`.
+ */
+export async function updateProductStatus(
+  id: string,
+  status: "ACTIVE" | "INACTIVE",
+) {
   return prisma.product.update({
     where: { id },
     data: { status },

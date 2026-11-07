@@ -8,7 +8,23 @@ import {
 } from "./product.types.js";
 import { type z } from "zod";
 
-export function validateProductCreate(req: Request, res: Response, next: NextFunction) {
+/*
+ * Product request validation middleware (routes -> validate -> controller).
+ * Each function runs a Zod schema from `product.types.ts` and, on success, hands the
+ * parsed (coerced, defaulted) value to the controller. Failures go to `next` as a
+ * ValidationError (HTTP 422) with a per-field error list.
+ */
+
+/**
+ * Validates the POST /products body and replaces `req.body` with the parsed result.
+ *
+ * @throws {ValidationError} 422 (passed to `next`) when the body is invalid or has unknown fields.
+ */
+export function validateProductCreate(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   const result = createProductSchema.safeParse(req.body);
 
   if (!result.success) {
@@ -23,7 +39,16 @@ export function validateProductCreate(req: Request, res: Response, next: NextFun
   return next();
 }
 
-export function validateProductUpdate(req: Request, res: Response, next: NextFunction) {
+/**
+ * Validates the PATCH /products/:id body; all fields optional, unknown fields rejected.
+ *
+ * @throws {ValidationError} 422 (passed to `next`) when the body is invalid.
+ */
+export function validateProductUpdate(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   const result = updateProductSchema.safeParse(req.body);
 
   if (!result.success) {
@@ -38,7 +63,16 @@ export function validateProductUpdate(req: Request, res: Response, next: NextFun
   return next();
 }
 
-export function validateProductStatus(req: Request, res: Response, next: NextFunction) {
+/**
+ * Validates the PATCH /products/:id/status body (`status` must be ACTIVE or INACTIVE).
+ *
+ * @throws {ValidationError} 422 (passed to `next`) when the body is invalid.
+ */
+export function validateProductStatus(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   const result = productStatusSchema.safeParse(req.body);
 
   if (!result.success) {
@@ -53,7 +87,18 @@ export function validateProductStatus(req: Request, res: Response, next: NextFun
   return next();
 }
 
-export function validateProductQuery(req: Request, res: Response, next: NextFunction) {
+/**
+ * Validates the GET /products query string and stores the result on `req.validatedQuery`.
+ *
+ * `req.query` itself is left untouched.
+ *
+ * @throws {ValidationError} 422 (passed to `next`) when the query is invalid.
+ */
+export function validateProductQuery(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   const result = productQuerySchema.safeParse(req.query);
 
   if (!result.success) {

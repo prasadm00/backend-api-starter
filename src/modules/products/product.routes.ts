@@ -14,6 +14,11 @@ import {
   validateProductQuery,
 } from "./product.validate.js";
 
+/*
+ * Product routes: maps URLs to middleware and controllers
+ * (routes -> validate -> controller -> service -> repository).
+ * Reads are public; writes require authentication and the ADMIN role.
+ */
 const router = Router();
 
 // Public routes
